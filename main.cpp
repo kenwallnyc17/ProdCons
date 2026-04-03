@@ -1,19 +1,39 @@
+
 #include <windows.h>
 #include <processthreadsapi.h>
 #include <winbase.h>
 
-#include <iomanip>
-#include <sstream>
 #include <iostream>
-#include <concepts>
-#include <memory>
-#include <atomic>
-#include <thread>
-#include <mutex>
-#include <chrono>
+#include <cstdint>
+#include <cassert>
+#include <bitset>
+
+#include <streambuf>
+#include <fstream>
+#include <sstream>
+#include <map>
+#include <unordered_map>
+#include <string>
+#include <list>
 #include <deque>
+#include <array>
+#include <flat_map>
+#include <initializer_list>
+#include <functional>
+#include <utility>
+#include <concepts>
+#include <type_traits>
+#include <string.h>
+#include <limits>
+#include <optional>
+#include <thread>
+#include <chrono>
+#include <mutex>
+#include <time.h>
+#include <sys/stat.h>
 
 using namespace std;
+
 
 template <typename T>
 constexpr auto type_name() {
@@ -36,15 +56,31 @@ constexpr auto type_name() {
   return name;
 }
 
-#include "ProdConsMPMCSlot.h"
-#include "ProdConsSPSCVariable.h"
+//#include "BookBuilder.h"
+//#include "MktDataSystem.h"
+#include "MktDataSystemRun.h"
+
+//#include "SymIdxTest.h"
 
 int main()
 {
+    cout << "Hello world!" << endl;
 
-    PRODCONSSPECIFIC::test_spscvariable_2();
+  //  BookBuilder bb("pi_file.dat", BookBuilder::logLevel::DATA);
 
-    PRODCONSSPECIFIC::test_mpmcslot_1();
+  //  bb();
+
+ //   MKTDATASYSTEM::test_mktsystem_1();
+
+   // fread();
+
+   // int bkts{20};
+
+    //cin >> bkts;
+
+    startFeedHandler();
+
+    //run_instructionset();
 
     return 0;
 }
