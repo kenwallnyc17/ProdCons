@@ -1,3 +1,12 @@
+struct alignas(64) MapNode {
+    uint64_t        key;
+    GeminiPrcLevelGeneric value;
+    uint32_t        left;
+    uint32_t        right;
+    uint32_t        parent;
+    int32_t         height;
+};
+
 // Chunk-size config: 65536 nodes per block keeps math to fast bit shifts (16 bits)
 constexpr uint32_t CHUNK_SHIFT = 16;
 constexpr uint32_t CHUNK_SIZE  = 1U << CHUNK_SHIFT;
