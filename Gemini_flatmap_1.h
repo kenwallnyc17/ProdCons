@@ -296,7 +296,12 @@ private:
         bool found = false;
 
         while (current) {
-            __m256i oids = _mm256_set_epi64x(0, current->block.oid, current->block.oid, 0);
+            __m256i oids = _mm256_set_epi64x(
+                                                0,                                // Lane 3: Zero Padding
+                                            current->block[2].oid,            // Lane 2: Order 2 ID
+                                            current->block[1].oid,            // Lane 1: Order 1 ID
+                                            current->block[0].oid             // Lane 0: Order 0 ID
+                                        );
             int mask = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(target, oids)));
             if (mask > 0 || true) {
                 for (uint32_t i = 0; i < 3; ++i) {
