@@ -1,5 +1,5 @@
 
-// 10-bit configuration: Exactly 1,024 nodes (64 KB) per chunk
+// 10-bit configuration: Exactly 1,024 nodes (64 KB) per segmented block chunk
 constexpr uint32_t CHUNK_SHIFT = 10;
 constexpr uint32_t CHUNK_SIZE  = 1U << CHUNK_SHIFT;
 constexpr uint32_t CHUNK_MASK  = CHUNK_SIZE - 1;
@@ -175,6 +175,7 @@ private:
         update_height(x);
         return x;
     }
+
     uint32_t rotate_left(uint32_t x) noexcept {
         uint32_t y = pool_.get(x).right;
         uint32_t T2 = pool_.get(y).left;
@@ -187,6 +188,7 @@ private:
         update_height(y);
         return y;
     }
+
     uint32_t rebalance(uint32_t idx) noexcept {
         update_height(idx);
         int32_t balance = get_balance(idx);
@@ -200,6 +202,7 @@ private:
         }
         return idx;
     }
+
     void balance_upward(uint32_t idx) noexcept {
         while (idx != NIL) {
             uint32_t p = pool_.get(idx).parent;
@@ -214,43 +217,6 @@ private:
             }
             idx = p;
         }
-    }
-
-    struct EmplaceResult { uint32_t new_root; bool inserted; };
-    template <typename... Args>
-    EmplaceResult emplace_recursive(uint32_t node_idx, uint32_t parent_idx, uint64_t key, MapNode*& out_ptr, Args&&... args) noexcept {
-        if (node_idx == NIL) {
-            uint32_t fresh_idx = pool_.allocate(key);
-            MapNode& fresh_node = pool_.get(fresh_idx);
-            fresh_node.value = PrcLevelGeneric{std::forward<Args>(args)...};
-            fresh_node.parent = parent_idx;
-            ++size_;
-            out_ptr = &fresh_node; 
-            return {fresh_idx, true};
-        }
-
-        EmplaceResult res{NIL, false};
-        uint64_t current_key = pool_.get(node_idx).key;
-
-        if (comp_(key, current_key)) {
-            res = emplace_recursive(pool_.get(node_idx).left, node_idx, key, out_ptr, std::forward<Args>(args)...);
-            // Fetch dynamically here. Vector growth during recursive allocation will not invalidate this lookup.
-            pool_.get(node_idx).left = res.new_root;
-            if (res.new_root != NIL) pool_.get(res.new_root).parent = node_idx;
-        } else if (comp_(current_key, key)) {
-            res = emplace_recursive(pool_.get(node_idx).right, node_idx, key, out_ptr, std::forward<Args>(args)...);
-            pool_.get(node_idx).right = res.new_root;
-            if (res.new_root != NIL) pool_.get(res.new_root).parent = node_idx;
-        } else {
-            out_ptr = pool_.get_ptr(node_idx);
-            return {node_idx, false};
-        }
-
-        uint32_t balanced_root = rebalance(node_idx);
-        if (balanced_root != node_idx) pool_.get(balanced_root).parent = parent_idx;
-        
-        res.new_root = balanced_root;
-        return res;
     }
 
     uint32_t get_extreme_node(uint32_t idx, bool find_min) const noexcept {
@@ -275,13 +241,47 @@ public:
     [[nodiscard]] [[gnu::always_inline]] inline size_t size() const noexcept { return size_; }
     [[nodiscard]] [[gnu::always_inline]] inline bool empty() const noexcept { return size_ == 0; }
 
+    // Purely Iterative Try Emplace: Immune to reference tracking bugs across allocations
     template <typename... Args>
     [[gnu::always_inline]] inline std::pair<MapNode*, bool> try_emplace(uint64_t key, Args&&... args) noexcept {
-        MapNode* target_node_ptr = nullptr;
-        auto [new_root, inserted] = emplace_recursive(root_, NIL, key, target_node_ptr, std::forward<Args>(args)...);
-        root_ = new_root;
-        if (root_ != NIL) pool_.get(root_).parent = NIL;
-        return {target_node_ptr, inserted};
+        if (root_ == NIL) [[unlikely]] {
+            root_ = pool_.allocate(key);
+            MapNode& r_node = pool_.get(root_);
+            r_node.value = PrcLevelGeneric{std::forward<Args>(args)...};
+            ++size_;
+            return {&r_node, true};
+        }
+
+        uint32_t current = root_;
+        uint32_t parent = NIL;
+        bool go_left = false;
+
+        while (current != NIL) {
+            parent = current;
+            uint64_t curr_key = pool_.get(current).key;
+            if (comp_(key, curr_key)) {
+                current = pool_.get(current).left;
+                go_left = true;
+            } else if (comp_(curr_key, key)) {
+                current = pool_.get(current).right;
+                go_left = false;
+            } else {
+                return {pool_.get_ptr(current), false}; 
+            }
+        }
+
+        // Allocate the leaf node. Dynamic growth events here cannot invalidate loop lookups
+        uint32_t fresh_idx = pool_.allocate(key);
+        MapNode& fresh_node = pool_.get(fresh_idx);
+        fresh_node.value = PrcLevelGeneric{std::forward<Args>(args)...};
+        fresh_node.parent = parent;
+
+        if (go_left) pool_.get(parent).left = fresh_idx;
+        else pool_.get(parent).right = fresh_idx;
+
+        ++size_;
+        balance_upward(parent);
+        return {&fresh_node, true};
     }
 
     [[gnu::always_inline]] void erase(MapNode* node_ptr) noexcept {
