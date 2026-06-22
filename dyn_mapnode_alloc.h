@@ -456,5 +456,7 @@ PreallocatedNodePool() { grow_pool(); }
     return NIL;
 }
 
+:new (static_cast<void*>(new_chunk + i)) MapNode{};
+
 
 
