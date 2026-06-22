@@ -376,5 +376,85 @@ public:
 };
 
 
+// --- OLD FIXED-SIZE VARIABLES ---
+// std::array<MapNode, MaxNodes + 1> storage_;
+// uint32_t free_head_{1};
+
+// --- NEW GROWING VARIABLES ---
+std::vector<MapNode*> chunks_;
+uint32_t free_head_{0}; // Initialized to 0 (NIL)
+uint32_t total_capacity_{0};
+
+// Sizing config: 65536 nodes per chunk handles math via 16-bit bitwise shifts
+static constexpr uint32_t CHUNK_SHIFT = 16;
+static constexpr uint32_t CHUNK_SIZE  = 1U << CHUNK_SHIFT;
+static constexpr uint32_t CHUNK_MASK  = CHUNK_SIZE - 1;
+
+// --- ADD THIS METHODS BLOCK TO YOUR POOL CLASS ---
+void grow_pool() {
+    MapNode* new_chunk = static_cast<MapNode*>(std::aligned_alloc(64, CHUNK_SIZE * sizeof(MapNode)));
+    chunks_.push_back(new_chunk);
+
+    uint32_t start_idx = total_capacity_;
+    
+    if (start_idx == 0) {
+        // Safe placement new initialization for index 0 (The NIL sentinel node)
+        ::new (static_cast<void*>(new_chunk)) MapNode{0, {}, NIL, NIL, NIL, 0};
+        
+        for (uint32_t i = 1; i < CHUNK_SIZE; ++i) {
+            ::new (static_cast<void*>(&new_chunk[i])) MapNode{};
+            new_chunk[i].left = (i < CHUNK_SIZE - 1) ? (i + 1) : free_head_;
+        }
+        free_head_ = 1;
+    } else {
+        // Initialize general sequential extensions
+        for (uint32_t i = 0; i < CHUNK_SIZE; ++i) {
+            ::new (static_cast<void*>(&new_chunk[i])) MapNode{};
+            new_chunk[i].left = start_idx + i + 1;
+        }
+        new_chunk[CHUNK_SIZE - 1].left = free_head_;
+        free_head_ = start_idx;
+    }
+    total_capacity_ += CHUNK_SIZE;
+}
+
+// Modify your constructor and destructor handles
+PreallocatedNodePool() { grow_pool(); }
+~PreallocatedNodePool() noexcept {
+    for (MapNode* chunk : chunks_) {
+        for (uint32_t i = 0; i < CHUNK_SIZE; ++i) chunk[i].~MapNode();
+        std::free(chunk);
+    }
+}
+
+// Update the allocation hook pass
+[[nodiscard]] [[gnu::always_inline]] inline uint32_t allocate(uint64_t key) noexcept {
+    if (free_head_ == NIL) [[unlikely]] grow_pool(); 
+    
+    uint32_t allocated_idx = free_head_;
+    free_head_ = get(allocated_idx).left; 
+    
+    MapNode& node = get(allocated_idx);
+    node.key = key; node.left = NIL; node.right = NIL; node.parent = NIL; node.height = 1;
+    return allocated_idx;
+}
+
+// --- NEW O(1) BITWISE LOOKUPS ---
+[[nodiscard]] [[gnu::always_inline]] inline const MapNode& get(uint32_t idx) const noexcept { return chunks_[idx >> CHUNK_SHIFT][idx & CHUNK_MASK]; }
+[[nodiscard]] [[gnu::always_inline]] inline MapNode& get(uint32_t idx) noexcept { return chunks_[idx >> CHUNK_SHIFT][idx & CHUNK_MASK]; }
+[[nodiscard]] [[gnu::always_inline]] inline const MapNode* get_ptr(uint32_t idx) const noexcept { return &chunks_[idx >> CHUNK_SHIFT][idx & CHUNK_MASK]; }
+[[nodiscard]] [[gnu::always_inline]] inline MapNode* get_ptr(uint32_t idx) noexcept { return &chunks_[idx >> CHUNK_SHIFT][idx & CHUNK_MASK]; }
+
+// --- REPLACED POINTER SUBTRACTION TRANSLATION ---
+[[nodiscard]] inline uint32_t get_index(const MapNode* ptr) const noexcept {
+    if (!ptr) return NIL;
+    for (size_t i = 0; i < chunks_.size(); ++i) {
+        if (ptr >= chunks_[i] && ptr < chunks_[i] + CHUNK_SIZE) {
+            return static_cast<uint32_t>((i << CHUNK_SHIFT) + (ptr - chunks_[i]));
+        }
+    }
+    return NIL;
+}
+
 
 
