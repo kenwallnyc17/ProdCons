@@ -460,3 +460,51 @@ PreallocatedNodePool() { grow_pool(); }
 
 
 
+
+
+struct EmplaceResult { uint32_t new_root; bool inserted; MapNode* node_ptr; };
+    
+    template <typename... Args>
+    EmplaceResult emplace_recursive(uint32_t node_idx, uint32_t parent_idx, uint64_t key, Args&&... args) noexcept {
+        if (node_idx == NIL) {
+            uint32_t fresh_idx = pool_.allocate(key);
+            MapNode& fresh_node = pool_.get(fresh_idx);
+            fresh_node.value = PrcLevelGeneric{std::forward<Args>(args)...};
+            fresh_node.parent = parent_idx;
+            ++size_;
+            return {fresh_idx, true, &fresh_node};
+        }
+
+        auto& node = pool_.get(node_idx);
+        EmplaceResult res;
+
+        if (comp_(key, node.key)) {
+            res = emplace_recursive(node.left, node_idx, key, std::forward<Args>(args)...);
+            node.left = res.new_root;
+            if (node.left != NIL) {
+                pool_.get(node.left).parent = node_idx; // Enforce child-to-parent linkage consistency
+            }
+        } else if (comp_(node.key, key)) {
+            res = emplace_recursive(node.right, node_idx, key, std::forward<Args>(args)...);
+            node.right = res.new_root;
+            if (node.right != NIL) {
+                pool_.get(node.right).parent = node_idx; // Enforce child-to-parent linkage consistency
+            }
+        } else {
+            return {node_idx, false, &node};
+        }
+
+        // Rebalance the node and capture any structural rotation root changes
+        uint32_t balanced_root = rebalance(node_idx);
+        
+        // Ensure that if a rotation shifted the node topology, its parent pointer is correct
+        if (balanced_root != node_idx) {
+            pool_.get(balanced_root).parent = parent_idx;
+        }
+
+        res.new_root = balanced_root;
+        return res;
+    }
+
+
+
