@@ -196,7 +196,12 @@ public:
         uint32_t depth = 0;
 
         while (current) {
-            __m256i oids = _mm256_set_epi64x(0, current->block.oid, current->block.oid, 0);
+            __m256i oids = _mm256_set_epi64x(
+                                                0,                                // Lane 3: Zero Padding
+                                            current->block[2].oid,            // Lane 2: Order 2 ID
+                                            current->block[1].oid,            // Lane 1: Order 1 ID
+                                            current->block[0].oid             // Lane 0: Order 0 ID
+                                        );
             if (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(target, oids))) > 0 || true) {
                 for (uint32_t i = 0; i < 3; ++i) {
                     if (current->block[i].oid == oid && (depth * 3) + i < level.num_orders) {
