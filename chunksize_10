@@ -108,7 +108,6 @@ public:
     }
 };
 
-
 template <typename Compare>
 class FastNodeMap;
 
@@ -217,32 +216,39 @@ private:
         }
     }
 
-    struct EmplaceResult { uint32_t new_root; bool inserted; MapNode* node_ptr; };
+    struct EmplaceResult { uint32_t new_root; bool inserted; };
     template <typename... Args>
-    EmplaceResult emplace_recursive(uint32_t node_idx, uint32_t parent_idx, uint64_t key, Args&&... args) noexcept {
+    EmplaceResult emplace_recursive(uint32_t node_idx, uint32_t parent_idx, uint64_t key, MapNode*& out_ptr, Args&&... args) noexcept {
         if (node_idx == NIL) {
             uint32_t fresh_idx = pool_.allocate(key);
             MapNode& fresh_node = pool_.get(fresh_idx);
             fresh_node.value = PrcLevelGeneric{std::forward<Args>(args)...};
             fresh_node.parent = parent_idx;
             ++size_;
-            return {fresh_idx, true, &fresh_node};
+            out_ptr = &fresh_node; 
+            return {fresh_idx, true};
         }
-        auto& node = pool_.get(node_idx);
-        EmplaceResult res;
-        if (comp_(key, node.key)) {
-            res = emplace_recursive(node.left, node_idx, key, std::forward<Args>(args)...);
-            node.left = res.new_root;
-            if (node.left != NIL) pool_.get(node.left).parent = node_idx;
-        } else if (comp_(node.key, key)) {
-            res = emplace_recursive(node.right, node_idx, key, std::forward<Args>(args)...);
-            node.right = res.new_root;
-            if (node.right != NIL) pool_.get(node.right).parent = node_idx;
+
+        EmplaceResult res{NIL, false};
+        uint64_t current_key = pool_.get(node_idx).key;
+
+        if (comp_(key, current_key)) {
+            res = emplace_recursive(pool_.get(node_idx).left, node_idx, key, out_ptr, std::forward<Args>(args)...);
+            // Fetch dynamically here. Vector growth during recursive allocation will not invalidate this lookup.
+            pool_.get(node_idx).left = res.new_root;
+            if (res.new_root != NIL) pool_.get(res.new_root).parent = node_idx;
+        } else if (comp_(current_key, key)) {
+            res = emplace_recursive(pool_.get(node_idx).right, node_idx, key, out_ptr, std::forward<Args>(args)...);
+            pool_.get(node_idx).right = res.new_root;
+            if (res.new_root != NIL) pool_.get(res.new_root).parent = node_idx;
         } else {
-            return {node_idx, false, &node};
+            out_ptr = pool_.get_ptr(node_idx);
+            return {node_idx, false};
         }
+
         uint32_t balanced_root = rebalance(node_idx);
         if (balanced_root != node_idx) pool_.get(balanced_root).parent = parent_idx;
+        
         res.new_root = balanced_root;
         return res;
     }
@@ -271,10 +277,11 @@ public:
 
     template <typename... Args>
     [[gnu::always_inline]] inline std::pair<MapNode*, bool> try_emplace(uint64_t key, Args&&... args) noexcept {
-        auto [new_root, inserted, node_ptr] = emplace_recursive(root_, NIL, key, std::forward<Args>(args)...);
+        MapNode* target_node_ptr = nullptr;
+        auto [new_root, inserted] = emplace_recursive(root_, NIL, key, target_node_ptr, std::forward<Args>(args)...);
         root_ = new_root;
         if (root_ != NIL) pool_.get(root_).parent = NIL;
-        return {node_ptr, inserted};
+        return {target_node_ptr, inserted};
     }
 
     [[gnu::always_inline]] void erase(MapNode* node_ptr) noexcept {
@@ -374,55 +381,4 @@ public:
 };
 
 
-
-
-
-struct EmplaceResult { uint32_t new_root; bool inserted; };
-    
-    template <typename... Args>
-    EmplaceResult emplace_recursive(uint32_t node_idx, uint32_t parent_idx, uint64_t key, MapNode*& out_ptr, Args&&... args) noexcept {
-        if (node_idx == NIL) {
-            uint32_t fresh_idx = pool_.allocate(key);
-            MapNode& fresh_node = pool_.get(fresh_idx);
-            fresh_node.value = PrcLevelGeneric{std::forward<Args>(args)...};
-            fresh_node.parent = parent_idx;
-            ++size_;
-            out_ptr = &fresh_node; // Safely lock down the true target pointer address directly
-            return {fresh_idx, true};
-        }
-
-        auto& node = pool_.get(node_idx);
-        EmplaceResult res{NIL, false};
-
-        if (comp_(key, node.key)) {
-            res = emplace_recursive(node.left, node_idx, key, out_ptr, std::forward<Args>(args)...);
-            node.left = res.new_root;
-            if (node.left != NIL) pool_.get(node.left).parent = node_idx;
-        } else if (comp_(node.key, key)) {
-            res = emplace_recursive(node.right, node_idx, key, out_ptr, std::forward<Args>(args)...);
-            node.right = res.new_root;
-            if (node.right != NIL) pool_.get(node.right).parent = node_idx;
-        } else {
-            out_ptr = &node; // Key matches: track pointer, but set inserted to false
-            return {node_idx, false};
-        }
-
-        uint32_t balanced_root = rebalance(node_idx);
-        if (balanced_root != node_idx) {
-            pool_.get(balanced_root).parent = parent_idx;
-        }
-        
-        res.new_root = balanced_root;
-        return res;
-    }
-
-
-template <typename... Args>
-    [[gnu::always_inline]] inline std::pair<MapNode*, bool> try_emplace(uint64_t key, Args&&... args) noexcept {
-        MapNode* target_node_ptr = nullptr;
-        auto [new_root, inserted] = emplace_recursive(root_, NIL, key, target_node_ptr, std::forward<Args>(args)...);
-        root_ = new_root;
-        if (root_ != NIL) pool_.get(root_).parent = NIL;
-        return {target_node_ptr, inserted};
-    }
 
