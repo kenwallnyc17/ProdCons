@@ -508,3 +508,45 @@ struct EmplaceResult { uint32_t new_root; bool inserted; MapNode* node_ptr; };
 
 
 
+
+
+
+void grow_pool() {
+    // Allocate cache-line aligned heap memory block
+    MapNode* new_chunk = static_cast<MapNode*>(std::aligned_alloc(64, CHUNK_SIZE * sizeof(MapNode)));
+    if (!new_chunk) [[unlikely]] {
+        throw std::bad_alloc();
+    }
+    chunks_.push_back(new_chunk);
+
+    uint32_t start_idx = total_capacity_;
+
+    // Explicitly zero-initialize the memory block segments via placement new
+    for (uint32_t i = 0; i < CHUNK_SIZE; ++i) {
+        ::new (static_cast<void*>(new_chunk + i)) MapNode{};
+    }
+
+    if (start_idx == 0) {
+        // Safe explicit baseline structure initialization for the sentinel node at index 0
+        new_chunk[NIL] = MapNode{0, {}, NIL, NIL, NIL, 0};
+        
+        // Link slots 1 through 65535 together sequentially
+        for (uint32_t i = 1; i < CHUNK_SIZE - 1; ++i) {
+            new_chunk[i].left = i + 1;
+        }
+        new_chunk[CHUNK_SIZE - 1].left = free_head_;
+        free_head_ = 1; // Start allocating from slot index 1
+    } else {
+        // Subsequent extension blocks calculate free paths utilizing global indices
+        for (uint32_t i = 0; i < CHUNK_SIZE - 1; ++i) {
+            new_chunk[i].left = start_idx + i + 1; // Link directly to the next global index slot
+        }
+        // The last element of this new block wraps backward to latch the previous free list head
+        new_chunk[CHUNK_SIZE - 1].left = free_head_;
+        free_head_ = start_idx; // Move free list head directly to the first element of this new block
+    }
+
+    total_capacity_ += CHUNK_SIZE;
+}
+
+
