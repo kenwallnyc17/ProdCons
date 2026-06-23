@@ -1,0 +1,321 @@
+// Size: Exactly 64 bytes (1 CPU Cache Line)
+struct alignas(64) MapNode {
+    uint64_t        key;        
+    PrcLevelGeneric value;      
+    uint32_t        psl;        
+    uint32_t        padding; 
+};
+
+constexpr uint32_t CHUNK_SHIFT = 10;
+constexpr uint32_t CHUNK_SIZE  = 1U << CHUNK_SHIFT; 
+constexpr uint32_t CHUNK_MASK  = CHUNK_SIZE - 1;
+
+class DynamicNodePool {
+private:
+    std::vector<MapNode*> chunks_;
+    uint32_t total_slots_{0};
+
+public:
+    DynamicNodePool() { 
+        grow_pool(1); 
+    }
+    
+    ~DynamicNodePool() noexcept {
+        for (MapNode* chunk : chunks_) {
+            if (chunk) {
+                for (uint32_t i = 0; i < CHUNK_SIZE; ++i) chunk[i].~MapNode();
+                std::free(chunk);
+            }
+        }
+    }
+
+    DynamicNodePool(const DynamicNodePool&) = delete;
+    DynamicNodePool& operator=(const DynamicNodePool&) = delete;
+
+    void grow_pool(size_t chunk_count) {
+        chunks_.reserve(chunks_.size() + chunk_count);
+        for (size_t c = 0; c < chunk_count; ++c) {
+            void* raw_mem = std::aligned_alloc(64, CHUNK_SIZE * sizeof(MapNode));
+            if (!raw_mem) [[unlikely]] throw std::bad_alloc();
+            
+            MapNode* new_chunk = static_cast<MapNode*>(raw_mem);
+            for (uint32_t i = 0; i < CHUNK_SIZE; ++i) {
+                ::new (static_cast<void*>(new_chunk + i)) MapNode{0, {}, 0, 0};
+            }
+            chunks_.push_back(new_chunk);
+            total_slots_ += CHUNK_SIZE;
+        }
+    }
+
+    [[nodiscard]] [[gnu::always_inline]] inline size_t capacity() const noexcept { return total_slots_; }
+
+    [[nodiscard]] [[gnu::always_inline]] inline MapNode& get(uint32_t idx) noexcept {
+        return chunks_[idx >> CHUNK_SHIFT][idx & CHUNK_MASK];
+    }
+    [[nodiscard]] [[gnu::always_inline]] inline const MapNode& get(uint32_t idx) const noexcept {
+        return chunks_[idx >> CHUNK_SHIFT][idx & CHUNK_MASK];
+    }
+
+    [[nodiscard]] inline uint32_t get_index(const MapNode* ptr) const noexcept {
+        if (!ptr) return 0xFFFFFFFF;
+        for (size_t i = 0; i < chunks_.size(); ++i) {
+            if (ptr >= chunks_[i] && ptr < chunks_[i] + CHUNK_SIZE) {
+                return static_cast<uint32_t>((i << CHUNK_SHIFT) + (ptr - chunks_[i]));
+            }
+        }
+        return 0xFFFFFFFF;
+    }
+};
+
+template <typename Compare> class FastNodeMap;
+
+template <typename Compare, bool IsConst = false>
+class MapIterator {
+private:
+    using MapType = std::conditional_t<IsConst, const FastNodeMap<Compare>, FastNodeMap<Compare>>;
+    MapType* container_;
+    size_t   vector_pos_; 
+
+public:
+    using iterator_category = std::forward_iterator_tag;
+    using value_type        = MapNode;
+    using difference_type   = std::ptrdiff_t;
+    using pointer           = std::conditional_t<IsConst, const MapNode*, MapNode*>;
+    using reference         = std::conditional_t<IsConst, const MapNode&, MapNode&>;
+
+    MapIterator(MapType* container, size_t vector_pos) noexcept 
+        : container_(container), vector_pos_(vector_pos) {}
+    
+    [[nodiscard]] inline reference operator*() const noexcept { 
+        return container_->get_pool().get(container_->get_sorted_indices()[vector_pos_]); 
+    }
+    [[nodiscard]] inline pointer operator->() const noexcept { 
+        return &container_->get_pool().get(container_->get_sorted_indices()[vector_pos_]); 
+    }
+    
+    inline MapIterator& operator++() noexcept {
+        ++vector_pos_;
+        return *this;
+    }
+    inline MapIterator operator++(int) noexcept {
+        MapIterator tmp = *this;
+        ++vector_pos_;
+        return tmp;
+    }
+    [[nodiscard]] inline bool operator==(const MapIterator& o) const noexcept { return vector_pos_ == o.vector_pos_; }
+    [[nodiscard]] inline bool operator!=(const MapIterator& o) const noexcept { return vector_pos_ != o.vector_pos_; }
+};
+
+template <typename Compare = std::less<uint64_t>>
+class FastNodeMap {
+private:
+    DynamicNodePool       pool_;
+    std::vector<uint32_t> sorted_indices_; 
+    size_t                size_{0};
+    [[no_unique_address]] Compare comp_;
+
+    [[nodiscard]] [[gnu::always_inline]] inline uint32_t hash_key(uint64_t key) const noexcept {
+        key ^= key >> 30;
+        key *= 0xbf58476d1ce4e5b9ULL;
+        key ^= key >> 27;
+        return static_cast<uint32_t>(key);
+    }
+
+    [[gnu::noinline]] void rehash_expand() {
+        size_t current_chunks = pool_.capacity() / CHUNK_SIZE;
+        pool_.grow_pool(current_chunks); 
+        
+        size_t old_capacity = pool_.capacity() / 2;
+        size_t old_size = size_;
+        size_ = 0;
+        
+        std::vector<MapNode> temp_buffer;
+        temp_buffer.reserve(old_size);
+
+        for (uint32_t i = 0; i < old_capacity; ++i) {
+            if (pool_.get(i).psl != 0) {
+                temp_buffer.push_back(pool_.get(i));
+                pool_.get(i).psl = 0; 
+            }
+        }
+
+        sorted_indices_.clear();
+
+        for (const auto& item : temp_buffer) {
+            try_emplace_internal(item.key, item.value);
+        }
+    }
+
+    inline void try_emplace_internal(uint64_t key, const PrcLevelGeneric& val) noexcept {
+        uint32_t cap_mask = static_cast<uint32_t>(pool_.capacity() - 1);
+        uint32_t bucket = hash_key(key) & cap_mask;
+        
+        uint64_t current_key = key;
+        PrcLevelGeneric current_value = val;
+        uint32_t current_psl = 1;
+
+        while (true) {
+            MapNode& slot = pool_.get(bucket);
+            if (slot.psl == 0) {
+                slot.key = current_key; slot.value = current_value; slot.psl = current_psl;
+                
+                uint32_t global_idx = pool_.get_index(&slot);
+                auto it = std::lower_bound(sorted_indices_.begin(), sorted_indices_.end(), global_idx, [this](uint32_t a, uint32_t b) {
+                    return comp_(pool_.get(a).key, pool_.get(b).key);
+                });
+                sorted_indices_.insert(it, global_idx);
+                
+                ++size_;
+                return;
+            }
+            if (current_psl > slot.psl) {
+                std::swap(current_key, slot.key);
+                std::swap(current_value, slot.value);
+                std::swap(current_psl, slot.psl);
+            }
+            bucket = (bucket + 1) & cap_mask;
+            ++current_psl;
+        }
+    }
+
+public:
+    using iterator       = MapIterator<Compare, false>;
+    using const_iterator = MapIterator<Compare, true>;
+
+    [[nodiscard]] inline iterator begin() noexcept { return iterator(this, 0); }
+    [[nodiscard]] inline iterator end() noexcept   { return iterator(this, sorted_indices_.size()); }
+    [[nodiscard]] inline const_iterator begin() const noexcept { return const_iterator(this, 0); }
+    [[nodiscard]] inline const_iterator end() const noexcept   { return const_iterator(this, sorted_indices_.size()); }
+    
+    [[nodiscard]] inline DynamicNodePool& get_pool() noexcept { return pool_; }
+    [[nodiscard]] inline const DynamicNodePool& get_pool() const noexcept { return pool_; }
+    [[nodiscard]] inline const std::vector<uint32_t>& get_sorted_indices() const noexcept { return sorted_indices_; }
+
+    [[nodiscard]] [[gnu::always_inline]] inline size_t size() const noexcept { return size_; }
+    [[nodiscard]] [[gnu::always_inline]] inline bool empty() const noexcept { return size_ == 0; }
+
+    void reserve(size_t expected_nodes) {
+        size_t baseline_needed = (expected_nodes * 10) / 7; 
+        if (baseline_needed <= pool_.capacity()) return;
+        
+        size_t current_cap = pool_.capacity();
+        size_t chunks_to_add = 0;
+        while (current_cap < baseline_needed) {
+            chunks_to_add += (current_cap / CHUNK_SIZE);
+            current_cap *= 2;
+        }
+        if (chunks_to_add > 0) pool_.grow_pool(chunks_to_add);
+        sorted_indices_.reserve(expected_nodes);
+    }
+
+    [[nodiscard]] inline uint32_t next_index(uint32_t current_idx) const noexcept {
+        uint32_t cap = static_cast<uint32_t>(pool_.capacity());
+        if (current_idx == static_cast<uint32_t>(-1)) {
+            return sorted_indices_.empty() ? cap : 0;
+        }
+        return (current_idx + 1 < sorted_indices_.size()) ? current_idx + 1 : cap;
+    }
+
+    template <typename... Args>
+    [[gnu::always_inline]] inline std::pair<MapNode*, bool> try_emplace(uint64_t key, Args&&... args) noexcept {
+        if (size_ * 10 >= pool_.capacity() * 7) [[unlikely]] {
+            rehash_expand();
+        }
+
+        uint32_t cap_mask = static_cast<uint32_t>(pool_.capacity() - 1);
+        uint32_t bucket = hash_key(key) & cap_mask;
+        
+        uint64_t current_key = key;
+        PrcLevelGeneric current_value{std::forward<Args>(args)...};
+        uint32_t current_psl = 1;
+
+        MapNode* first_inserted_ptr = nullptr;
+
+        while (true) {
+            MapNode& slot = pool_.get(bucket);
+
+            if (slot.psl == 0) {
+                slot.key = current_key; slot.value = current_value; slot.psl = current_psl;
+                
+                uint32_t global_idx = pool_.get_index(&slot);
+                auto it = std::lower_bound(sorted_indices_.begin(), sorted_indices_.end(), global_idx, [this](uint32_t a, uint32_t b) {
+                    return comp_(pool_.get(a).key, pool_.get(b).key);
+                });
+                sorted_indices_.insert(it, global_idx);
+
+                ++size_;
+                if (!first_inserted_ptr) first_inserted_ptr = &slot;
+                return {first_inserted_ptr, true};
+            }
+
+            if (slot.key == current_key) {
+                return {&slot, false};
+            }
+
+            if (current_psl > slot.psl) {
+                std::swap(current_key, slot.key);
+                std::swap(current_value, slot.value);
+                std::swap(current_psl, slot.psl);
+                if (!first_inserted_ptr) first_inserted_ptr = &slot;
+            }
+
+            bucket = (bucket + 1) & cap_mask;
+            ++current_psl;
+        }
+    }
+
+    [[gnu::always_inline]] void erase(MapNode* node_ptr) noexcept {
+        if (!node_ptr) return;
+        uint32_t cap_mask = static_cast<uint32_t>(pool_.capacity() - 1);
+        
+        uint32_t target_idx = pool_.get_index(node_ptr);
+        if (target_idx == 0xFFFFFFFF) [[unlikely]] return;
+        
+        auto it = std::find(sorted_indices_.begin(), sorted_indices_.end(), target_idx);
+        if (it != sorted_indices_.end()) sorted_indices_.erase(it);
+
+        uint32_t bucket = target_idx;
+        while (true) {
+            uint32_t next_bucket = (bucket + 1) & cap_mask;
+            MapNode& next_slot = pool_.get(next_bucket);
+
+            if (next_slot.psl <= 1) {
+                pool_.get(bucket).psl = 0; 
+                break;
+            }
+
+            uint32_t old_next_global_idx = pool_.get_index(&next_slot);
+            pool_.get(bucket) = next_slot;
+            --pool_.get(bucket).psl;
+            
+            auto s_it = std::find(sorted_indices_.begin(), sorted_indices_.end(), old_next_global_idx);
+            if (s_it != sorted_indices_.end()) *s_it = bucket;
+
+            bucket = next_bucket;
+        }
+        --size_;
+    }
+
+    [[nodiscard]] [[gnu::always_inline]] inline MapNode* find(uint64_t key) noexcept {
+        uint32_t cap_mask = static_cast<uint32_t>(pool_.capacity() - 1);
+        uint32_t bucket = hash_key(key) & cap_mask;
+        uint32_t psl = 1;
+
+        while (true) {
+            MapNode& slot = pool_.get(bucket);
+            if (slot.psl == 0 || psl > slot.psl) return nullptr;
+            if (slot.key == key) return &slot;
+            bucket = (bucket + 1) & cap_mask;
+            ++psl;
+        }
+    }
+
+    [[gnu::always_inline]] inline size_t extract_volumes_simd(uint32_t* __restrict__ destination_array) const noexcept {
+        uint32_t* aligned_dest = static_cast<uint32_t*>(__builtin_assume_aligned(destination_array, 64));
+        size_t count = 0;
+        for (uint32_t idx : sorted_indices_) {
+            aligned_dest[count++] = pool_.get(idx).value.agg_sz;
+        }
+        return count; 
+    }
+};
