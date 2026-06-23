@@ -1,120 +1,71 @@
 
-constexpr uint32_t CHUNK_SHIFT = 10;
-constexpr uint32_t CHUNK_SIZE  = 1U << CHUNK_SHIFT;
-constexpr uint32_t CHUNK_MASK  = CHUNK_SIZE - 1;
-
-class DynamicNodePool {
-private:
-    std::vector<MapNode*> chunks_;
-    uint32_t free_head_{NIL};
-    uint32_t total_capacity_{0};
-
-    [[gnu::noinline]] void grow_pool() {
-        void* raw_mem = std::aligned_alloc(64, CHUNK_SIZE * sizeof(MapNode));
-        if (!raw_mem) throw std::bad_alloc();
-        
-        MapNode* new_chunk = static_cast<MapNode*>(raw_mem);
-        chunks_.push_back(new_chunk);
-
-        uint32_t start_global_idx = total_capacity_;
-
-        for (uint32_t i = 0; i < CHUNK_SIZE; ++i) {
-            ::new (static_cast<void*>(new_chunk + i)) MapNode{0, {}, NIL, NIL, NIL, 0};
-        }
-
-        if (start_global_idx == 0) {
-            for (uint32_t i = 1; i < CHUNK_SIZE - 1; ++i) {
-                new_chunk[i].left = i + 1;
-            }
-            new_chunk[CHUNK_SIZE - 1].left = free_head_;
-            free_head_ = 1;
-        } else {
-            for (uint32_t i = 0; i < CHUNK_SIZE - 1; ++i) {
-                new_chunk[i].left = start_global_idx + i + 1;
-            }
-            new_chunk[CHUNK_SIZE - 1].left = free_head_;
-            free_head_ = start_global_idx;
-        }
-
-        total_capacity_ += CHUNK_SIZE;
-    }
-
-public:
-    DynamicNodePool() {
-        grow_pool();
-    }
-
-    ~DynamicNodePool() noexcept {
-        for (MapNode* chunk : chunks_) {
-            if (chunk) {
-                for (uint32_t i = 0; i < CHUNK_SIZE; ++i) {
-                    chunk[i].~MapNode();
-                }
-                std::free(chunk);
-            }
-        }
-    }
-
-    DynamicNodePool(const DynamicNodePool&) = delete;
-    DynamicNodePool& operator=(const DynamicNodePool&) = delete;
-
-    [[nodiscard]] [[gnu::always_inline]] inline uint32_t allocate(uint64_t key) noexcept {
-        if (free_head_ == NIL) [[unlikely]] {
-            grow_pool();
-        }
-
-        uint32_t allocated_idx = free_head_;
-        MapNode& node = get(allocated_idx);
-        free_head_ = node.left; 
-
-        node.key = key;
-        node.left = NIL;
-        node.right = NIL;
-        node.parent = NIL;
-        node.height = 1;
-
-        return allocated_idx;
-    }
-
-    [[gnu::always_inline]] inline void deallocate(uint32_t idx) noexcept {
-        if (idx == NIL) [[unlikely]] return;
-        MapNode& node = get(idx);
-        node.left = free_head_;
-        free_head_ = idx;
-    }
-
-    [[nodiscard]] [[gnu::always_inline]] inline MapNode& get(uint32_t idx) noexcept {
-        return chunks_[idx >> CHUNK_SHIFT][idx & CHUNK_MASK];
-    }
-    [[nodiscard]] [[gnu::always_inline]] inline const MapNode& get(uint32_t idx) const noexcept {
-        return chunks_[idx >> CHUNK_SHIFT][idx & CHUNK_MASK];
-    }
-    [[nodiscard]] [[gnu::always_inline]] inline MapNode* get_ptr(uint32_t idx) noexcept {
-        return &chunks_[idx >> CHUNK_SHIFT][idx & CHUNK_MASK];
-    }
-    [[nodiscard]] [[gnu::always_inline]] inline const MapNode* get_ptr(uint32_t idx) const noexcept {
-        return &chunks_[idx >> CHUNK_SHIFT][idx & CHUNK_MASK];
-    }
-
-    [[nodiscard]] inline uint32_t get_index(const MapNode* ptr) const noexcept {
-        if (!ptr) return NIL;
-        for (size_t i = 0; i < chunks_.size(); ++i) {
-            if (ptr >= chunks_[i] && ptr < chunks_[i] + CHUNK_SIZE) {
-                return static_cast<uint32_t>((i << CHUNK_SHIFT) + (ptr - chunks_[i]));
-            }
-        }
-        return NIL;
-    }
+// Size: Exactly 128 bytes (Spans 2 L1 Cache Lines perfectly). Fully aligned.
+struct alignas(64) MapNode {
+    uint64_t         key;        // 8 bytes
+    PrcLevelGeneric  value;      // 40 bytes
+    MapNode*         left;       // 8 bytes
+    MapNode*         right;      // 8 bytes
+    MapNode*         parent;     // 8 bytes
+    int32_t          height;     // 4 bytes
+    uint8_t          padding[4]; // Padding to secure exact 128-byte cache boundaries
 };
 
-template <typename Compare>
+template <size_t PreallocCapacity>
+class HybridNodePool {
+private:
+    alignas(64) std::array<uint8_t, PreallocCapacity * sizeof(MapNode)> arena_;
+    MapNode* free_head_{nullptr};
+    size_t   prealloc_used_{0};
+
+public:
+    HybridNodePool() noexcept {
+        MapNode* base = reinterpret_cast<MapNode*>(arena_.data());
+        for (size_t i = 0; i < PreallocCapacity - 1; ++i) {
+            base[i].left = &base[i + 1];
+        }
+        base[PreallocCapacity - 1].left = nullptr;
+        free_head_ = base;
+    }
+
+    [[nodiscard]] [[gnu::always_inline]] inline MapNode* allocate() noexcept {
+        if (free_head_) [[likely]] {
+            MapNode* node = free_head_;
+            free_head_ = free_head_->left;
+            ++prealloc_used_;
+            return node;
+        }
+        void* raw_mem = std::aligned_alloc(64, sizeof(MapNode));
+        if (!raw_mem) [[unlikely]] return nullptr;
+        return static_cast<MapNode*>(raw_mem);
+    }
+
+    [[gnu::always_inline]] inline void deallocate(MapNode* node) noexcept {
+        if (!node) [[unlikely]] return;
+        
+        uint8_t* ptr_bytes = reinterpret_cast<uint8_t*>(node);
+        if (ptr_bytes >= arena_.data() && ptr_bytes < arena_.data() + arena_.size()) [[likely]] {
+            node->left = free_head_;
+            free_head_ = node;
+            --prealloc_used_;
+        } else {
+            std::free(node); 
+        }
+    }
+
+    [[nodiscard]] inline size_t pool_usage() const noexcept { return prealloc_used_; }
+};
+
+template <size_t PreallocCapacity, typename Compare>
 class FastNodeMap;
 
-template <typename Compare>
+template <size_t PreallocCapacity, typename Compare>
 class MapIterator {
 private:
-    const FastNodeMap<Compare>* container_;
-    MapNode*                    ptr_;
+    const FastNodeMap<PreallocCapacity, Compare>* container_;
+    MapNode*                                      ptr_;
+
+    // Grant friendship so the map container can peel out the internal raw node address
+    friend class FastNodeMap<PreallocCapacity, Compare>;
 
 public:
     using iterator_category = std::forward_iterator_tag;
@@ -123,7 +74,7 @@ public:
     using pointer           = MapNode*;
     using reference         = MapNode&;
 
-    MapIterator(const FastNodeMap<Compare>* container, MapNode* ptr) noexcept 
+    MapIterator(const FastNodeMap<PreallocCapacity, Compare>* container, MapNode* ptr) noexcept 
         : container_(container), ptr_(ptr) {}
     
     [[nodiscard]] inline reference operator*() const noexcept { return *ptr_; }
@@ -142,110 +93,109 @@ public:
     [[nodiscard]] inline bool operator!=(const MapIterator& o) const noexcept { return ptr_ != o.ptr_; }
 };
 
-template <typename Compare = std::less<uint64_t>>
+template <size_t PreallocCapacity, typename Compare = std::less<uint64_t>>
 class FastNodeMap {
 private:
-    DynamicNodePool pool_;
-    uint32_t        root_{NIL};
-    size_t          size_{0};
+    HybridNodePool<PreallocCapacity> pool_;
+    MapNode* root_{nullptr};
+    size_t   size_{0};
     [[no_unique_address]] Compare comp_; 
 
-    [[nodiscard]] [[gnu::always_inline]] inline int32_t get_height(uint32_t idx) const noexcept { 
-        return (idx == NIL) ? 0 : pool_.get(idx).height; 
+    [[nodiscard]] [[gnu::always_inline]] inline int32_t get_height(MapNode* node) const noexcept { 
+        return node ? node->height : 0; 
     }
     
-    [[nodiscard]] [[gnu::always_inline]] inline int32_t get_balance(uint32_t idx) const noexcept {
-        if (idx == NIL) return 0;
-        return get_height(pool_.get(idx).left) - get_height(pool_.get(idx).right);
+    [[nodiscard]] [[gnu::always_inline]] inline int32_t get_balance(MapNode* node) const noexcept {
+        if (!node) return 0;
+        return get_height(node->left) - get_height(node->right);
     }
     
-    [[gnu::always_inline]] inline void update_height(uint32_t idx) noexcept {
-        if (idx != NIL) {
-            auto& node = pool_.get(idx);
-            node.height = 1 + std::max(get_height(node.left), get_height(node.right));
+    [[gnu::always_inline]] inline void update_height(MapNode* node) noexcept {
+        if (node) {
+            node->height = 1 + std::max(get_height(node->left), get_height(node->right));
         }
     }
 
-    uint32_t rotate_right(uint32_t y) noexcept {
-        uint32_t x = pool_.get(y).left;
-        uint32_t T2 = pool_.get(x).right;
+    MapNode* rotate_right(MapNode* y) noexcept {
+        MapNode* x = y->left;
+        MapNode* T2 = x->right;
 
-        pool_.get(x).right = y;
-        pool_.get(y).left = T2;
+        x->right = y;
+        y->left = T2;
 
-        pool_.get(x).parent = pool_.get(y).parent;
-        pool_.get(y).parent = x;
-        if (T2 != NIL) pool_.get(T2).parent = y;
+        x->parent = y->parent;
+        y->parent = x;
+        if (T2) T2->parent = y;
 
         update_height(y);
         update_height(x);
         return x;
     }
 
-    uint32_t rotate_left(uint32_t x) noexcept {
-        uint32_t y = pool_.get(x).right;
-        uint32_t T2 = pool_.get(y).left;
+    MapNode* rotate_left(MapNode* x) noexcept {
+        MapNode* y = x->right;
+        MapNode* T2 = y->left;
 
-        pool_.get(y).left = x;
-        pool_.get(x).right = T2;
+        y->left = x;
+        x->right = T2;
 
-        pool_.get(y).parent = pool_.get(x).parent;
-        pool_.get(x).parent = y;
-        if (T2 != NIL) pool_.get(T2).parent = x;
+        y->parent = x->parent;
+        x->parent = y;
+        if (T2) T2->parent = x;
 
         update_height(x);
         update_height(y);
         return y;
     }
 
-    uint32_t rebalance(uint32_t idx) noexcept {
-        update_height(idx);
-        int32_t balance = get_balance(idx);
+    MapNode* rebalance(MapNode* node) noexcept {
+        update_height(node);
+        int32_t balance = get_balance(node);
         if (balance > 1) {
-            if (get_balance(pool_.get(idx).left) < 0) {
-                pool_.get(idx).left = rotate_left(pool_.get(idx).left);
+            if (get_balance(node->left) < 0) {
+                node->left = rotate_left(node->left);
             }
-            return rotate_right(idx);
+            return rotate_right(node);
         }
         if (balance < -1) {
-            if (get_balance(pool_.get(idx).right) > 0) {
-                pool_.get(idx).right = rotate_right(pool_.get(idx).right);
+            if (get_balance(node->right) < 0) {
+                node->right = rotate_right(node->right);
             }
-            return rotate_left(idx);
+            return rotate_left(node);
         }
-        return idx;
+        return node;
     }
 
-    void balance_upward(uint32_t idx) noexcept {
-        while (idx != NIL) {
-            uint32_t p = pool_.get(idx).parent;
-            uint32_t new_sub_root = rebalance(idx);
+    void balance_upward(MapNode* node) noexcept {
+        while (node != nullptr) {
+            MapNode* p = node->parent;
+            MapNode* new_sub_root = rebalance(node);
             
-            if (p != NIL) {
-                if (pool_.get(p).left == idx) pool_.get(p).left = new_sub_root;
-                else pool_.get(p).right = new_sub_root;
-                pool_.get(new_sub_root).parent = p;
+            if (p != nullptr) {
+                if (p->left == node) p->left = new_sub_root;
+                else p->right = new_sub_root;
+                new_sub_root->parent = p;
             } else {
                 root_ = new_sub_root;
-                pool_.get(root_).parent = NIL;
+                root_->parent = nullptr;
             }
-            idx = p; 
+            node = p; 
         }
     }
 
-    uint32_t get_extreme_node(uint32_t idx, bool find_min) const noexcept {
-        uint32_t current = idx;
+    MapNode* get_extreme_node(MapNode* node, bool find_min) const noexcept {
+        MapNode* current = node;
         if (find_min) {
-            while (pool_.get(current).left != NIL) current = pool_.get(current).left;
+            while (current && current->left != nullptr) current = current->left;
         } else {
-            while (pool_.get(current).right != NIL) current = pool_.get(current).right;
+            while (current && current->right != nullptr) current = current->right;
         }
         return current;
     }
 
 public:
-    using iterator       = MapIterator<Compare>;
-    using const_iterator = MapIterator<Compare>;
+    using iterator       = MapIterator<PreallocCapacity, Compare>;
+    using const_iterator = MapIterator<PreallocCapacity, Compare>;
 
     [[nodiscard]] inline iterator begin() noexcept { return iterator(this, first()); }
     [[nodiscard]] inline iterator end() noexcept   { return iterator(this, nullptr); }
@@ -254,132 +204,167 @@ public:
 
     [[nodiscard]] [[gnu::always_inline]] inline size_t size() const noexcept { return size_; }
     [[nodiscard]] [[gnu::always_inline]] inline bool empty() const noexcept { return size_ == 0; }
+    [[nodiscard]] inline size_t prealloc_pool_usage() const noexcept { return pool_.pool_usage(); }
 
     template <typename... Args>
     [[gnu::always_inline]] inline std::pair<MapNode*, bool> try_emplace(uint64_t key, Args&&... args) noexcept {
-        if (root_ == NIL) [[unlikely]] {
-            root_ = pool_.allocate(key);
-            MapNode& r_node = pool_.get(root_);
-            r_node.value = PrcLevelGeneric{std::forward<Args>(args)...};
+        if (root_ == nullptr) [[unlikely]] {
+            root_ = pool_.allocate();
+            if (!root_) return {nullptr, false};
+            root_->key = key;
+            root_->value = PrcLevelGeneric{std::forward<Args>(args)...};
+            root_->left = nullptr; root_->right = nullptr; root_->parent = nullptr; root_->height = 1;
             ++size_;
-            return {&r_node, true};
+            return {root_, true};
         }
 
-        uint32_t current = root_;
-        uint32_t parent = NIL;
+        MapNode* current = root_;
+        MapNode* parent = nullptr;
         bool go_left = false;
 
-        while (current != NIL) {
+        while (current != nullptr) {
             parent = current;
-            uint64_t curr_key = pool_.get(current).key;
-            if (comp_(key, curr_key)) {
-                current = pool_.get(current).left;
+            if (comp_(key, current->key)) {
+                current = current->left;
                 go_left = true;
-            } else if (comp_(curr_key, key)) {
-                current = pool_.get(current).right;
+            } else if (comp_(current->key, key)) {
+                current = current->right;
                 go_left = false;
             } else {
-                return {pool_.get_ptr(current), false}; 
+                return {current, false}; 
             }
         }
 
-        uint32_t fresh_idx = pool_.allocate(key);
-        MapNode& fresh_node = pool_.get(fresh_idx);
-        fresh_node.value = PrcLevelGeneric{std::forward<Args>(args)...};
-        fresh_node.parent = parent;
+        MapNode* fresh_node = pool_.allocate();
+        if (!fresh_node) [[unlikely]] return {nullptr, false};
+        
+        fresh_node->key = key;
+        fresh_node->value = PrcLevelGeneric{std::forward<Args>(args)...};
+        fresh_node->left = nullptr; fresh_node->right = nullptr; fresh_node->parent = parent; fresh_node->height = 1;
 
-        if (go_left) pool_.get(parent).left = fresh_idx;
-        else pool_.get(parent).right = fresh_idx;
+        if (go_left) parent->left = fresh_node;
+        else parent->right = fresh_node;
 
         ++size_;
         balance_upward(parent);
-        return {&fresh_node, true};
+        return {fresh_node, true};
+    }
+
+    // Overloaded erase accepting standard iterators directly
+    [[gnu::always_inline]] inline void erase(iterator it) noexcept {
+        erase(it.ptr_);
     }
 
     [[gnu::always_inline]] void erase(MapNode* node_ptr) noexcept {
         if (node_ptr == nullptr) [[unlikely]] return;
-        uint32_t target_idx = pool_.get_index(node_ptr);
-        if (target_idx == NIL) [[unlikely]] return;
 
-        MapNode& node = pool_.get(target_idx);
-        uint32_t balance_start_node = NIL;
+        MapNode* balance_start_node = nullptr;
 
-        if (node.left == NIL || node.right == NIL) {
-            uint32_t child = (node.left != NIL) ? node.left : node.right;
-            uint32_t p = node.parent;
-            if (child != NIL) pool_.get(child).parent = p;
-            if (p != NIL) {
-                if (pool_.get(p).left == target_idx) pool_.get(p).left = child;
-                else pool_.get(p).right = child;
-                balance_start_node = p;
-            } else {
-                root_ = child;
-                if (root_ != NIL) pool_.get(root_).parent = NIL;
-            }
-            pool_.deallocate(target_idx);
-            --size_;
-        } else {
-            uint32_t successor_idx = get_extreme_node(node.right, true); 
-            MapNode& successor = pool_.get(successor_idx);
+        // Pure topological node swap pass prevents pointer corruption on deletion paths
+        if (node_ptr->left != nullptr && node_ptr->right != nullptr) {
+            MapNode* successor = get_extreme_node(node_ptr->right, true);
             
-            node.key = successor.key;
-            node.value = successor.value;
+            MapNode* p_t = node_ptr->parent;
+            MapNode* l_t = node_ptr->left;
+            MapNode* r_t = node_ptr->right;
+            int32_t  h_t = node_ptr->height;
 
-            uint32_t child = successor.right;
-            uint32_t p = successor.parent;
-            if (child != NIL) pool_.get(child).parent = p;
-            
-            if (p != target_idx) {
-                pool_.get(p).left = child;
-                balance_start_node = p;
+            MapNode* p_s = successor->parent;
+            MapNode* l_s = successor->left;
+            MapNode* r_s = successor->right;
+            int32_t  h_s = successor->height;
+
+            if (p_t != nullptr) {
+                if (p_t->left == node_ptr) p_t->left = successor;
+                else p_t->right = successor;
             } else {
-                node.right = child;
-                balance_start_node = target_idx;
+                root_ = successor;
             }
-            pool_.deallocate(successor_idx);
-            --size_;
+
+            if (p_s != node_ptr) {
+                if (p_s->left == successor) p_s->left = node_ptr;
+                else p_s->right = node_ptr;
+            }
+
+            if (l_t) l_t->parent = successor;
+            if (r_t && r_t != successor) r_t->parent = successor;
+            if (l_s) l_s->parent = node_ptr;
+            if (r_s) r_s->parent = node_ptr;
+
+            node_ptr->left = l_s;
+            node_ptr->right = r_s;
+            node_ptr->height = h_s;
+            
+            successor->left = l_t;
+            if (r_t == successor) {
+                successor->right = node_ptr;
+                node_ptr->parent = successor;
+            } else {
+                successor->right = r_t;
+                node_ptr->parent = p_s;
+            }
+            successor->height = h_t;
+            successor->parent = p_t;
         }
-        if (balance_start_node != NIL) balance_upward(balance_start_node);
+
+        MapNode* child = (node_ptr->left != nullptr) ? node_ptr->left : node_ptr->right;
+        MapNode* p = node_ptr->parent;
+
+        if (child != nullptr) child->parent = p;
+
+        if (p != nullptr) {
+            if (p->left == node_ptr) p->left = child;
+            else p->right = child;
+            balance_start_node = p;
+        } else {
+            root_ = child;
+            if (root_ != nullptr) root_->parent = nullptr;
+        }
+
+        pool_.deallocate(node_ptr);
+        --size_;
+
+        if (balance_start_node != nullptr) {
+            balance_upward(balance_start_node);
+        }
     }
 
     [[nodiscard]] [[gnu::always_inline]] inline const MapNode* find(uint64_t key) const noexcept {
-        uint32_t current = root_;
-        while (current != NIL) {
-            const MapNode* node = pool_.get_ptr(current);
-            if (key == node->key) [[likely]] return node;
-            current = comp_(key, node->key) ? node->left : node->right;
+        MapNode* current = root_;
+        while (current != nullptr) {
+            if (key == current->key) [[likely]] return current;
+            current = comp_(key, current->key) ? current->left : current->right;
         }
         return nullptr;
     }
     [[nodiscard]] [[gnu::always_inline]] inline MapNode* find(uint64_t key) noexcept {
-        uint32_t current = root_;
-        while (current != NIL) {
-            MapNode* node = pool_.get_ptr(current);
-            if (key == node->key) [[likely]] return node;
-            current = comp_(key, node->key) ? node->left : node->right;
+        MapNode* current = root_;
+        while (current != nullptr) {
+            if (key == current->key) [[likely]] return current;
+            current = comp_(key, current->key) ? current->left : current->right;
         }
         return nullptr;
     }
 
     [[nodiscard]] [[gnu::always_inline]] inline MapNode* first() noexcept {
-        if (root_ == NIL) return nullptr;
-        return pool_.get_ptr(get_extreme_node(root_, true));
+        if (root_ == nullptr) return nullptr;
+        return get_extreme_node(root_, true);
     }
     [[nodiscard]] [[gnu::always_inline]] inline const MapNode* first() const noexcept {
-        if (root_ == NIL) return nullptr;
-        return pool_.get_ptr(get_extreme_node(root_, true));
+        if (root_ == nullptr) return nullptr;
+        return get_extreme_node(root_, true);
     }
 
     [[nodiscard]] [[gnu::always_inline]] inline MapNode* next(const MapNode* current) const noexcept {
         if (!current) return nullptr;
-        uint32_t idx = pool_.get_index(current);
-        if (current->right != NIL) return const_cast<MapNode*>(pool_.get_ptr(get_extreme_node(current->right, true)));
-        uint32_t p = current->parent;
-        while (p != NIL && idx == pool_.get(p).right) {
+        if (current->right != nullptr) return const_cast<MapNode*>(get_extreme_node(current->right, true));
+        MapNode* idx = const_cast<MapNode*>(current);
+        MapNode* p = idx->parent;
+        while (p != nullptr && idx == p->right) {
             idx = p;
-            p = pool_.get(p).parent;
+            p = p->parent;
         }
-        return p == NIL ? nullptr : const_cast<MapNode*>(pool_.get_ptr(p));
+        return p;
     }
 
     [[gnu::always_inline]] inline size_t extract_volumes_simd(uint32_t* __restrict__ destination_array) const noexcept {
@@ -388,10 +373,9 @@ public:
         MapNode* curr = const_cast<FastNodeMap*>(this)->first();
         while (curr != nullptr) {
             aligned_dest[count++] = curr->value.agg_sz;
-            curr = next(curr);
-        }
-        return count; 
-    }
-};
+
+curr = next(curr);}return count;}};
+
+
 
 
