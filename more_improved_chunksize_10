@@ -55,6 +55,16 @@ public:
     [[nodiscard]] [[gnu::always_inline]] inline const MapNode& get(uint32_t idx) const noexcept {
         return chunks_[idx >> CHUNK_SHIFT][idx & CHUNK_MASK];
     }
+
+    [[nodiscard]] inline uint32_t get_index(const MapNode* ptr) const noexcept {
+        if (!ptr) return 0xFFFFFFFF;
+        for (size_t i = 0; i < chunks_.size(); ++i) {
+            if (ptr >= chunks_[i] && ptr < chunks_[i] + CHUNK_SIZE) {
+                return static_cast<uint32_t>((i << CHUNK_SHIFT) + (ptr - chunks_[i]));
+            }
+        }
+        return 0xFFFFFFFF;
+    }
 };
 
 template <typename Compare> class FastNodeMap;
@@ -234,7 +244,9 @@ public:
     [[gnu::always_inline]] void erase(MapNode* node_ptr) noexcept {
         if (!node_ptr) return;
         uint32_t cap_mask = static_cast<uint32_t>(pool_.capacity() - 1);
-        uint32_t bucket = static_cast<uint32_t>(node_ptr - &pool_.get(0)); 
+        
+        uint32_t bucket = pool_.get_index(node_ptr);
+        if (bucket == 0xFFFFFFFF) [[unlikely]] return;
         
         while (true) {
             uint32_t next_bucket = (bucket + 1) & cap_mask;
@@ -280,5 +292,6 @@ public:
         return count; 
     }
 };
+
 
 
