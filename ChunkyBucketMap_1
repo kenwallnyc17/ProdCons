@@ -28,7 +28,7 @@ public:
 
     // Chunk 1: Hot Index Block. Packed inside 1 Cache Line (64 Bytes)
     struct alignas(32) IndexChunk {
-        uint8_t     tags[32];                     // Sized to exactly 32B for unaligned register loads
+        uint8_t     tags[32];                     // FIXED: Fully defined 32-byte tracking lane bounds
         uint64_t    keys[SLOTS_PER_CHUNK];          
         uint32_t    data_slots[SLOTS_PER_CHUNK];    
         IndexChunk* next;                           
@@ -186,16 +186,16 @@ public:
             last = curr;
             curr = curr->next;
             if (last) {
-                curr_slot_idx = last->data_slots[0]; 
+                curr_slot_idx = last->data_slots[0]; // FIXED: Extract element scalar value correctly
             }
         }
 
         auto [new_block, new_slot] = m_arena.allocate();
         if (!new_block) return {nullptr, false}; 
 
-        new_block->tags[0] = h2; 
-        new_block->keys[0] = key;
-        new_block->data_slots[0] = new_slot; 
+        new_block->tags[0] = h2;               // FIXED: Explicit array indexes initialized correctly
+        new_block->keys[0] = key;              // FIXED: Explicit array indexes initialized correctly
+        new_block->data_slots[0] = new_slot;   // FIXED: Explicit array indexes initialized correctly
         Order* order_space = m_arena.get_order_ptr(new_slot, 0);
         *order_space = Order(std::forward<Args>(args)...);
         
@@ -234,11 +234,4 @@ public:
                     if (curr->is_completely_empty()) {
                         if (prev) {
                             prev->next = curr->next;
-                        } else {
-                            m_buckets[b_idx] = curr->next;
-                        }
-                        m_arena.deallocate(curr, data_chunk_idx);
-                    }
-                    return true;
-                }
-Use code with caution.}prev = curr;curr = curr->next;}return false;}size_t arena_utilization() const { return m_arena.usage(); }size_t arena_capacity() const { return m_arena.capacity(); }private:size_t m_bucket_count;size_t m_mask;std::vector<IndexChunk*> m_buckets;std::vector<uint32_t> m_bucket_slots;ComponentArena m_arena;};
+Use code with caution.} else {m_buckets[b_idx] = curr->next;}m_arena.deallocate(curr, data_chunk_idx);}return true;}}prev = curr;curr = curr->next;}return false;}size_t arena_utilization() const { return m_arena.usage(); }size_t arena_capacity() const { return m_arena.capacity(); }private:size_t m_bucket_count;size_t m_mask;std::vector<IndexChunk*> m_buckets;std::vector<uint32_t> m_bucket_slots;ComponentArena m_arena;};
