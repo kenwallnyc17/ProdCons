@@ -1,3 +1,81 @@
+MapNode* rotate_right(MapNode* y) noexcept {
+        MapNode* x = y->left;
+        MapNode* T2 = x->right;
+        MapNode* p = y->parent; // Capture original parent immediately
+
+        x->right = y;
+        y->left = T2;
+
+        // Establish upward parent link assignments cleanly
+        x->parent = p;
+        y->parent = x;
+        if (T2) T2->parent = y;
+
+        // CRITICAL FIX: Notify the original parent about its brand-new sub-root child
+        if (p != nullptr) {
+            if (p->left == y) p->left = x;
+            else p->right = x;
+        }
+
+        update_height(y);
+        update_height(x);
+        return x;
+    }
+
+    MapNode* rotate_left(MapNode* x) noexcept {
+        MapNode* y = x->right;
+        MapNode* T2 = y->left;
+        MapNode* p = x->parent; // Capture original parent immediately
+
+        y->left = x;
+        x->right = T2;
+
+        // Establish upward parent link assignments cleanly
+        y->parent = p;
+        x->parent = y;
+        if (T2) T2->parent = x;
+
+        // CRITICAL FIX: Notify the original parent about its brand-new sub-root child
+        if (p != nullptr) {
+            if (p->left == x) p->left = y;
+            else p->right = y;
+        }
+
+        update_height(x);
+        update_height(y);
+        return y;
+    }
+
+    // Streamlined upward rebalancing phase
+    void balance_upward(MapNode* node) noexcept {
+        while (node != nullptr) {
+            update_height(node);
+            int32_t balance = get_balance(node);
+
+            MapNode* new_sub_root = node;
+            if (balance > 1) {
+                if (get_balance(node->left) < 0) {
+                    node->left = rotate_left(node->left);
+                }
+                new_sub_root = rotate_right(node);
+            } else if (balance < -1) {
+                if (get_balance(node->right) > 0) {
+                    node->right = rotate_right(node->right);
+                }
+                new_sub_root = rotate_left(node);
+            }
+
+            if (new_sub_root->parent == nullptr) {
+                root_ = new_sub_root; // Capture top-level tree root updates smoothly
+            }
+            node = new_sub_root->parent; // Step straight up to parent register context
+        }
+    }
+
+
+
+
+
 
 // Size: Exactly 128 bytes (Spans 2 L1 Cache Lines perfectly). Fully aligned.
 struct alignas(64) MapNode {
