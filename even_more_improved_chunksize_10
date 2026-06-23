@@ -1,9 +1,10 @@
+
 // Size: Exactly 64 bytes (1 CPU Cache Line)
 struct alignas(64) MapNode {
     uint64_t        key;        
     PrcLevelGeneric value;      
-    uint32_t        psl;        
-    uint32_t        padding; 
+    uint32_t        next_free; 
+    uint32_t        is_active; 
 };
 
 constexpr uint32_t CHUNK_SHIFT = 10;
@@ -13,11 +14,12 @@ constexpr uint32_t CHUNK_MASK  = CHUNK_SIZE - 1;
 class DynamicNodePool {
 private:
     std::vector<MapNode*> chunks_;
+    uint32_t free_head_{0xFFFFFFFF};
     uint32_t total_slots_{0};
 
 public:
     DynamicNodePool() { 
-        grow_pool(1); 
+        grow_pool(); 
     }
     
     ~DynamicNodePool() noexcept {
@@ -32,19 +34,21 @@ public:
     DynamicNodePool(const DynamicNodePool&) = delete;
     DynamicNodePool& operator=(const DynamicNodePool&) = delete;
 
-    void grow_pool(size_t chunk_count) {
-        chunks_.reserve(chunks_.size() + chunk_count);
-        for (size_t c = 0; c < chunk_count; ++c) {
-            void* raw_mem = std::aligned_alloc(64, CHUNK_SIZE * sizeof(MapNode));
-            if (!raw_mem) [[unlikely]] throw std::bad_alloc();
-            
-            MapNode* new_chunk = static_cast<MapNode*>(raw_mem);
-            for (uint32_t i = 0; i < CHUNK_SIZE; ++i) {
-                ::new (static_cast<void*>(new_chunk + i)) MapNode{0, {}, 0, 0};
-            }
-            chunks_.push_back(new_chunk);
-            total_slots_ += CHUNK_SIZE;
+    void grow_pool() {
+        void* raw_mem = std::aligned_alloc(64, CHUNK_SIZE * sizeof(MapNode));
+        if (!raw_mem) [[unlikely]] throw std::bad_alloc();
+        
+        MapNode* new_chunk = static_cast<MapNode*>(raw_mem);
+        uint32_t start_global_idx = total_slots_;
+
+        for (uint32_t i = 0; i < CHUNK_SIZE; ++i) {
+            ::new (static_cast<void*>(new_chunk + i)) MapNode{0, {}, start_global_idx + i + 1, 0};
         }
+        new_chunk[CHUNK_SIZE - 1].next_free = free_head_;
+        free_head_ = start_global_idx;
+        
+        chunks_.push_back(new_chunk);
+        total_slots_ += CHUNK_SIZE;
     }
 
     [[nodiscard]] [[gnu::always_inline]] inline size_t capacity() const noexcept { return total_slots_; }
@@ -56,14 +60,25 @@ public:
         return chunks_[idx >> CHUNK_SHIFT][idx & CHUNK_MASK];
     }
 
-    [[nodiscard]] inline uint32_t get_index(const MapNode* ptr) const noexcept {
-        if (!ptr) return 0xFFFFFFFF;
-        for (size_t i = 0; i < chunks_.size(); ++i) {
-            if (ptr >= chunks_[i] && ptr < chunks_[i] + CHUNK_SIZE) {
-                return static_cast<uint32_t>((i << CHUNK_SHIFT) + (ptr - chunks_[i]));
-            }
+    [[nodiscard]] [[gnu::always_inline]] inline uint32_t allocate(uint64_t key) noexcept {
+        if (free_head_ >= total_slots_) [[unlikely]] {
+            grow_pool();
         }
-        return 0xFFFFFFFF;
+        uint32_t allocated_idx = free_head_;
+        MapNode& node = get(allocated_idx);
+        free_head_ = node.next_free;
+
+        node.key = key;
+        node.is_active = 1;
+        return allocated_idx;
+    }
+
+    [[gnu::always_inline]] inline void deallocate(uint32_t idx) noexcept {
+        if (idx >= total_slots_) [[unlikely]] return;
+        MapNode& node = get(idx);
+        node.is_active = 0;
+        node.next_free = free_head_;
+        free_head_ = idx;
     }
 };
 
@@ -110,9 +125,12 @@ template <typename Compare = std::less<uint64_t>>
 class FastNodeMap {
 private:
     DynamicNodePool       pool_;
+    std::vector<uint32_t> buckets_;        
     std::vector<uint32_t> sorted_indices_; 
     size_t                size_{0};
     [[no_unique_address]] Compare comp_;
+
+    static constexpr uint32_t EMPTY_BUCKET = 0xFFFFFFFF;
 
     [[nodiscard]] [[gnu::always_inline]] inline uint32_t hash_key(uint64_t key) const noexcept {
         key ^= key >> 30;
@@ -122,65 +140,46 @@ private:
     }
 
     [[gnu::noinline]] void rehash_expand() {
-        size_t current_chunks = pool_.capacity() / CHUNK_SIZE;
-        pool_.grow_pool(current_chunks); 
-        
-        size_t old_capacity = pool_.capacity() / 2;
-        size_t old_size = size_;
-        size_ = 0;
-        
-        std::vector<MapNode> temp_buffer;
-        temp_buffer.reserve(old_size);
+        size_t old_capacity = buckets_.size();
+        size_t new_capacity = old_capacity * 2;
+        buckets_.assign(new_capacity, EMPTY_BUCKET);
 
-        for (uint32_t i = 0; i < old_capacity; ++i) {
-            if (pool_.get(i).psl != 0) {
-                temp_buffer.push_back(pool_.get(i));
-                pool_.get(i).psl = 0; 
-            }
-        }
+        uint32_t cap_mask = static_cast<uint32_t>(new_capacity - 1);
 
-        sorted_indices_.clear();
+        for (uint32_t pool_idx : sorted_indices_) {
+            const MapNode& node = pool_.get(pool_idx);
+            uint32_t bucket = hash_key(node.key) & cap_mask;
+            
+            uint32_t current_pool_idx = pool_idx;
+            uint32_t current_psl = 1;
 
-        for (const auto& item : temp_buffer) {
-            try_emplace_internal(item.key, item.value);
-        }
-    }
-
-    inline void try_emplace_internal(uint64_t key, const PrcLevelGeneric& val) noexcept {
-        uint32_t cap_mask = static_cast<uint32_t>(pool_.capacity() - 1);
-        uint32_t bucket = hash_key(key) & cap_mask;
-        
-        uint64_t current_key = key;
-        PrcLevelGeneric current_value = val;
-        uint32_t current_psl = 1;
-
-        while (true) {
-            MapNode& slot = pool_.get(bucket);
-            if (slot.psl == 0) {
-                slot.key = current_key; slot.value = current_value; slot.psl = current_psl;
+            while (true) {
+                uint32_t slot_val = buckets_[bucket];
+                if (slot_val == EMPTY_BUCKET) {
+                    buckets_[bucket] = current_pool_idx;
+                    break;
+                }
                 
-                uint32_t global_idx = pool_.get_index(&slot);
-                auto it = std::lower_bound(sorted_indices_.begin(), sorted_indices_.end(), global_idx, [this](uint32_t a, uint32_t b) {
-                    return comp_(pool_.get(a).key, pool_.get(b).key);
-                });
-                sorted_indices_.insert(it, global_idx);
-                
-                ++size_;
-                return;
+                uint32_t slot_hash = hash_key(pool_.get(slot_val).key);
+                uint32_t slot_psl = ((bucket + new_capacity - (slot_hash & cap_mask)) & cap_mask) + 1;
+
+                if (current_psl > slot_psl) {
+                    std::swap(current_pool_idx, buckets_[bucket]);
+                    current_psl = slot_psl;
+                }
+                bucket = (bucket + 1) & cap_mask;
+                ++current_psl;
             }
-            if (current_psl > slot.psl) {
-                std::swap(current_key, slot.key);
-                std::swap(current_value, slot.value);
-                std::swap(current_psl, slot.psl);
-            }
-            bucket = (bucket + 1) & cap_mask;
-            ++current_psl;
         }
     }
 
 public:
     using iterator       = MapIterator<Compare, false>;
     using const_iterator = MapIterator<Compare, true>;
+
+    FastNodeMap() {
+        buckets_.assign(1024, EMPTY_BUCKET); 
+    }
 
     [[nodiscard]] inline iterator begin() noexcept { return iterator(this, 0); }
     [[nodiscard]] inline iterator end() noexcept   { return iterator(this, sorted_indices_.size()); }
@@ -196,115 +195,136 @@ public:
 
     void reserve(size_t expected_nodes) {
         size_t baseline_needed = (expected_nodes * 10) / 7; 
-        if (baseline_needed <= pool_.capacity()) return;
-        
-        size_t current_cap = pool_.capacity();
-        size_t chunks_to_add = 0;
+        size_t current_cap = buckets_.size();
         while (current_cap < baseline_needed) {
-            chunks_to_add += (current_cap / CHUNK_SIZE);
             current_cap *= 2;
         }
-        if (chunks_to_add > 0) pool_.grow_pool(chunks_to_add);
+        buckets_.assign(current_cap, EMPTY_BUCKET);
         sorted_indices_.reserve(expected_nodes);
-    }
-
-    [[nodiscard]] inline uint32_t next_index(uint32_t current_idx) const noexcept {
-        uint32_t cap = static_cast<uint32_t>(pool_.capacity());
-        if (current_idx == static_cast<uint32_t>(-1)) {
-            return sorted_indices_.empty() ? cap : 0;
-        }
-        return (current_idx + 1 < sorted_indices_.size()) ? current_idx + 1 : cap;
     }
 
     template <typename... Args>
     [[gnu::always_inline]] inline std::pair<MapNode*, bool> try_emplace(uint64_t key, Args&&... args) noexcept {
-        if (size_ * 10 >= pool_.capacity() * 7) [[unlikely]] {
+        if (size_ * 10 >= buckets_.size() * 7) [[unlikely]] {
             rehash_expand();
         }
 
-        uint32_t cap_mask = static_cast<uint32_t>(pool_.capacity() - 1);
+        uint32_t cap_mask = static_cast<uint32_t>(buckets_.size() - 1);
         uint32_t bucket = hash_key(key) & cap_mask;
-        
-        uint64_t current_key = key;
-        PrcLevelGeneric current_value{std::forward<Args>(args)...};
-        uint32_t current_psl = 1;
+        uint32_t psl = 1;
 
-        MapNode* first_inserted_ptr = nullptr;
+        uint32_t check_bucket = bucket;
+        while (true) {
+            uint32_t slot_val = buckets_[check_bucket];
+            if (slot_val == EMPTY_BUCKET) break;
+            
+            MapNode& node = pool_.get(slot_val);
+            uint32_t slot_hash = hash_key(node.key);
+            uint32_t slot_psl = ((check_bucket + buckets_.size() - (slot_hash & cap_mask)) & cap_mask) + 1;
+
+            if (psl > slot_psl) break;
+            if (node.key == key) return {&node, false};
+
+            check_bucket = (check_bucket + 1) & cap_mask;
+            ++psl;
+        }
+
+        uint32_t pool_idx = pool_.allocate(key);
+        MapNode& fresh_node = pool_.get(pool_idx);
+        fresh_node.value = PrcLevelGeneric{std::forward<Args>(args)...};
+
+        uint32_t current_pool_idx = pool_idx;
+        uint32_t current_psl = 1;
+        MapNode* first_inserted_ptr = &fresh_node;
 
         while (true) {
-            MapNode& slot = pool_.get(bucket);
+            uint32_t slot_val = buckets_[bucket];
 
-            if (slot.psl == 0) {
-                slot.key = current_key; slot.value = current_value; slot.psl = current_psl;
-                
-                uint32_t global_idx = pool_.get_index(&slot);
-                auto it = std::lower_bound(sorted_indices_.begin(), sorted_indices_.end(), global_idx, [this](uint32_t a, uint32_t b) {
-                    return comp_(pool_.get(a).key, pool_.get(b).key);
-                });
-                sorted_indices_.insert(it, global_idx);
-
-                ++size_;
-                if (!first_inserted_ptr) first_inserted_ptr = &slot;
-                return {first_inserted_ptr, true};
+            if (slot_val == EMPTY_BUCKET) {
+                buckets_[bucket] = current_pool_idx;
+                break;
             }
 
-            if (slot.key == current_key) {
-                return {&slot, false};
-            }
+            MapNode& slot_node = pool_.get(slot_val);
+            uint32_t slot_hash = hash_key(slot_node.key);
+            uint32_t slot_psl = ((bucket + buckets_.size() - (slot_hash & cap_mask)) & cap_mask) + 1;
 
-            if (current_psl > slot.psl) {
-                std::swap(current_key, slot.key);
-                std::swap(current_value, slot.value);
-                std::swap(current_psl, slot.psl);
-                if (!first_inserted_ptr) first_inserted_ptr = &slot;
+            if (current_psl > slot_psl) {
+                std::swap(current_pool_idx, buckets_[bucket]);
+                current_psl = slot_psl;
             }
 
             bucket = (bucket + 1) & cap_mask;
             ++current_psl;
         }
+
+        auto it = std::lower_bound(sorted_indices_.begin(), sorted_indices_.end(), pool_idx, [this](uint32_t a, uint32_t b) {
+            return comp_(pool_.get(a).key, pool_.get(b).key);
+        });
+        sorted_indices_.insert(it, pool_idx);
+        ++size_;
+
+        return {first_inserted_ptr, true};
     }
 
     [[gnu::always_inline]] void erase(MapNode* node_ptr) noexcept {
-        if (!node_ptr) return;
-        uint32_t cap_mask = static_cast<uint32_t>(pool_.capacity() - 1);
+        if (!node_ptr || node_ptr->is_active == 0) return;
         
-        uint32_t target_idx = pool_.get_index(node_ptr);
-        if (target_idx == 0xFFFFFFFF) [[unlikely]] return;
+        uint32_t cap_mask = static_cast<uint32_t>(buckets_.size() - 1);
+        uint32_t bucket = hash_key(node_ptr->key) & cap_mask;
         
-        auto it = std::find(sorted_indices_.begin(), sorted_indices_.end(), target_idx);
-        if (it != sorted_indices_.end()) sorted_indices_.erase(it);
+        while (buckets_[bucket] != EMPTY_BUCKET) {
+            if (&pool_.get(buckets_[bucket]) == node_ptr) break;
+            bucket = (bucket + 1) & cap_mask;
+        }
+        if (buckets_[bucket] == EMPTY_BUCKET) return;
 
-        uint32_t bucket = target_idx;
+        uint32_t target_pool_idx = buckets_[bucket];
+
+        auto s_it = std::find(sorted_indices_.begin(), sorted_indices_.end(), target_pool_idx);
+        if (s_it != sorted_indices_.end()) sorted_indices_.erase(s_it);
+
         while (true) {
             uint32_t next_bucket = (bucket + 1) & cap_mask;
-            MapNode& next_slot = pool_.get(next_bucket);
+            uint32_t next_val = buckets_[next_bucket];
 
-            if (next_slot.psl <= 1) {
-                pool_.get(bucket).psl = 0; 
+            if (next_val == EMPTY_BUCKET) {
+                buckets_[bucket] = EMPTY_BUCKET;
                 break;
             }
 
-            uint32_t old_next_global_idx = pool_.get_index(&next_slot);
-            pool_.get(bucket) = next_slot;
-            --pool_.get(bucket).psl;
-            
-            auto s_it = std::find(sorted_indices_.begin(), sorted_indices_.end(), old_next_global_idx);
-            if (s_it != sorted_indices_.end()) *s_it = bucket;
+            uint32_t next_hash = hash_key(pool_.get(next_val).key);
+            uint32_t next_psl = ((next_bucket + buckets_.size() - (next_hash & cap_mask)) & cap_mask) + 1;
 
+            if (next_psl <= 1) {
+                buckets_[bucket] = EMPTY_BUCKET;
+                break;
+            }
+
+            buckets_[bucket] = next_val;
             bucket = next_bucket;
         }
+
+        pool_.deallocate(target_pool_idx);
         --size_;
     }
 
     [[nodiscard]] [[gnu::always_inline]] inline MapNode* find(uint64_t key) noexcept {
-        uint32_t cap_mask = static_cast<uint32_t>(pool_.capacity() - 1);
+        uint32_t cap_mask = static_cast<uint32_t>(buckets_.size() - 1);
         uint32_t bucket = hash_key(key) & cap_mask;
         uint32_t psl = 1;
 
         while (true) {
-            MapNode& slot = pool_.get(bucket);
-            if (slot.psl == 0 || psl > slot.psl) return nullptr;
-            if (slot.key == key) return &slot;
+            uint32_t slot_val = buckets_[bucket];
+            if (slot_val == EMPTY_BUCKET) return nullptr;
+            
+            MapNode& node = pool_.get(slot_val);
+            uint32_t slot_hash = hash_key(node.key);
+            uint32_t slot_psl = ((bucket + buckets_.size() - (slot_hash & cap_mask)) & cap_mask) + 1;
+
+            if (psl > slot_psl) return nullptr;
+            if (node.key == key) return &node;
+
             bucket = (bucket + 1) & cap_mask;
             ++psl;
         }
