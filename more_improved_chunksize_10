@@ -1,4 +1,4 @@
-// Size: Exactly 64 bytes (1 CPU Cache Line)
+// Size: Exactly 64 bytes (Fits 1 CPU Cache Line perfectly)
 struct alignas(64) MapNode {
     uint64_t        key;        
     PrcLevelGeneric value;      
@@ -7,7 +7,7 @@ struct alignas(64) MapNode {
 };
 
 constexpr uint32_t CHUNK_SHIFT = 10;
-constexpr uint32_t CHUNK_SIZE  = 1U << CHUNK_SHIFT; // 1,024 elements (64 KB) per chunk
+constexpr uint32_t CHUNK_SIZE  = 1U << CHUNK_SHIFT; 
 constexpr uint32_t CHUNK_MASK  = CHUNK_SIZE - 1;
 
 class DynamicNodePool {
@@ -194,8 +194,26 @@ public:
 
     [[nodiscard]] inline uint32_t next_index(uint32_t current_idx) const noexcept {
         uint32_t cap = static_cast<uint32_t>(pool_.capacity());
-        for (uint32_t i = current_idx + 1; i < cap; ++i) {
-            if (pool_.get(i).psl != 0) return i;
+        
+        std::vector<uint32_t> sorted_indices;
+        sorted_indices.reserve(size_);
+        for (uint32_t i = 0; i < cap; ++i) {
+            if (pool_.get(i).psl != 0) sorted_indices.push_back(i);
+        }
+        
+        std::sort(sorted_indices.begin(), sorted_indices.end(), [this](uint32_t a, uint32_t b) {
+            return comp_(pool_.get(a).key, pool_.get(b).key);
+        });
+
+        if (current_idx == static_cast<uint32_t>(-1)) {
+            // FIXED: Returns the scalar element of the vector directly
+            return sorted_indices.empty() ? cap : sorted_indices[0]; 
+        }
+
+        for (size_t i = 0; i < sorted_indices.size(); ++i) {
+            if (sorted_indices[i] == current_idx) {
+                return (i + 1 < sorted_indices.size()) ? sorted_indices[i + 1] : cap;
+            }
         }
         return cap;
     }
@@ -292,6 +310,7 @@ public:
         return count; 
     }
 };
+
 
 
 
