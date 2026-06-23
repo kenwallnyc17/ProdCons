@@ -27,7 +27,7 @@ public:
     static constexpr size_t SLOTS_PER_CHUNK = 4;
 
     struct alignas(32) Chunk {
-        uint8_t  tags[32];                 // 32-byte explicit bounds array layout
+        uint8_t  tags[32];                 // Explicitly sized to 32 bytes for AVX2 register loading
         uint64_t keys[SLOTS_PER_CHUNK];    
         Order    values[SLOTS_PER_CHUNK];  
         Chunk*   next;                     
@@ -37,13 +37,21 @@ public:
             std::memset(tags, TAG_EMPTY, sizeof(tags));
             std::memset(keys, 0, sizeof(keys));
         }
+
+        bool is_completely_empty() const {
+            __m256i tag_lane = _mm256_load_si256(reinterpret_cast<const __m256i*>(tags));
+            __m256i empty_v = _mm256_cmpeq_epi8(tag_lane, _mm256_set1_epi8(static_cast<char>(TAG_EMPTY)));
+            __m256i tomb_v  = _mm256_cmpeq_epi8(tag_lane, _mm256_set1_epi8(static_cast<char>(TAG_DELETED)));
+            uint32_t free_mask = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_or_si256(empty_v, tomb_v))) & 0xF;
+            return free_mask == 0xF; 
+        }
     };
 
 private:
     // --- Pre-allocated Static Memory Arena ---
     class ChunkArena {
     public:
-        explicit ChunkArena(size_t max_chunks) : m_next_free(0) {
+        explicit ChunkArena(size_t max_chunks) : m_next_free(0), m_free_list_head(nullptr) {
             size_t bytes = max_chunks * sizeof(Chunk);
             m_storage = reinterpret_cast<Chunk*>(_mm_malloc(bytes, 32));
             if (!m_storage) throw std::bad_alloc();
@@ -53,10 +61,21 @@ private:
         ~ChunkArena() { _mm_free(m_storage); }
 
         Chunk* allocate() {
+            if (m_free_list_head) {
+                Chunk* recycled = m_free_list_head;
+                m_free_list_head = m_free_list_head->next;
+                recycled->init();
+                return recycled;
+            }
             if (__builtin_expect(m_next_free >= m_max_chunks, 0)) return nullptr;
             Chunk* chunk = &m_storage[m_next_free++];
             chunk->init();
             return chunk;
+        }
+
+        void deallocate(Chunk* chunk) {
+            chunk->next = m_free_list_head;
+            m_free_list_head = chunk;
         }
 
         size_t usage() const { return m_next_free; }
@@ -66,6 +85,7 @@ private:
         Chunk* m_storage;
         size_t m_next_free;
         size_t m_max_chunks;
+        Chunk* m_free_list_head; 
     };
 
 public:
@@ -82,7 +102,7 @@ public:
 
     // --- FIND (100% Hashless) ---
     Order* find(uint64_t key) {
-        size_t b_idx = key & m_mask; // Direct indexing optimization
+        size_t b_idx = key & m_mask; // Zero-overhead direct indexing
         Chunk* curr = m_buckets[b_idx];
 
         uint8_t h2 = static_cast<uint8_t>(key & 0x7F);
@@ -90,6 +110,7 @@ public:
         __m256i target_key = _mm256_set1_epi64x(static_cast<long long>(key));
 
         while (curr) {
+            // Highly performant AVX aligned lane instructions
             __m256i tag_lane = _mm256_load_si256(reinterpret_cast<const __m256i*>(curr->tags));
             __m256i tag_match = _mm256_cmpeq_epi8(tag_lane, target_tag);
             uint32_t tag_mask = static_cast<uint32_t>(_mm256_movemask_epi8(tag_match)) & 0xF; 
@@ -156,10 +177,11 @@ public:
         return {&new_block->values[0], true};
     }
 
-    // --- ERASE ---
+    // --- ERASE (100% Hashless) ---
     bool erase(uint64_t key) {
         size_t b_idx = key & m_mask;
         Chunk* curr = m_buckets[b_idx];
+        Chunk* prev = nullptr;
 
         uint8_t h2 = static_cast<uint8_t>(key & 0x7F);
         __m256i target_tag = _mm256_set1_epi8(static_cast<char>(h2));
@@ -182,11 +204,24 @@ public:
                     curr->tags[slot_idx] = TAG_DELETED; 
                     curr->keys[slot_idx] = 0;
                     curr->values[slot_idx] = Order();   
+
+                    if (curr->is_completely_empty()) {
+                        if (prev) {
+                            prev->next = curr->next;
+                        } else {
+                            m_buckets[b_idx] = curr->next;
+                        }
+                        m_arena.deallocate(curr);
+                    }
                     return true;
                 }
             }
+            prev = curr;
             curr = curr->next;
         }
         return false;
     }
+
+    size_t arena_utilization() const { return m_arena.usage(); }
+    size_t arena_capacity() const { return m_arena.capacity(); }
 };
