@@ -107,7 +107,6 @@ public:
     }
 };
 
-
 template <typename Compare>
 class FastNodeMap;
 
@@ -151,11 +150,15 @@ private:
     size_t          size_{0};
     [[no_unique_address]] Compare comp_; 
 
-    [[nodiscard]] [[gnu::always_inline]] inline int32_t get_height(uint32_t idx) const noexcept { return pool_.get(idx).height; }
+    [[nodiscard]] [[gnu::always_inline]] inline int32_t get_height(uint32_t idx) const noexcept { 
+        return (idx == NIL) ? 0 : pool_.get(idx).height; 
+    }
+    
     [[nodiscard]] [[gnu::always_inline]] inline int32_t get_balance(uint32_t idx) const noexcept {
         if (idx == NIL) return 0;
         return get_height(pool_.get(idx).left) - get_height(pool_.get(idx).right);
     }
+    
     [[gnu::always_inline]] inline void update_height(uint32_t idx) noexcept {
         if (idx != NIL) {
             auto& node = pool_.get(idx);
@@ -170,7 +173,6 @@ private:
         pool_.get(x).right = y;
         pool_.get(y).left = T2;
 
-        // Correctly patch all parent metadata hooks to break cycle hazards
         pool_.get(x).parent = pool_.get(y).parent;
         pool_.get(y).parent = x;
         if (T2 != NIL) pool_.get(T2).parent = y;
@@ -187,7 +189,6 @@ private:
         pool_.get(y).left = x;
         pool_.get(x).right = T2;
 
-        // Correctly patch all parent metadata hooks to break cycle hazards
         pool_.get(y).parent = pool_.get(x).parent;
         pool_.get(x).parent = y;
         if (T2 != NIL) pool_.get(T2).parent = x;
@@ -228,7 +229,7 @@ private:
                 root_ = new_sub_root;
                 pool_.get(root_).parent = NIL;
             }
-            idx = p; // Safe scalar loop advance path
+            idx = p; 
         }
     }
 
@@ -320,12 +321,14 @@ public:
         } else {
             uint32_t successor_idx = get_extreme_node(node.right, true); 
             MapNode& successor = pool_.get(successor_idx);
+            
             node.key = successor.key;
             node.value = successor.value;
 
             uint32_t child = successor.right;
             uint32_t p = successor.parent;
             if (child != NIL) pool_.get(child).parent = p;
+            
             if (p != target_idx) {
                 pool_.get(p).left = child;
                 balance_start_node = p;
