@@ -1,5 +1,4 @@
 
-// 10-bit configuration: Exactly 1,024 nodes (64 KB) per segmented block chunk
 constexpr uint32_t CHUNK_SHIFT = 10;
 constexpr uint32_t CHUNK_SIZE  = 1U << CHUNK_SHIFT;
 constexpr uint32_t CHUNK_MASK  = CHUNK_SIZE - 1;
@@ -108,6 +107,7 @@ public:
     }
 };
 
+
 template <typename Compare>
 class FastNodeMap;
 
@@ -166,11 +166,15 @@ private:
     uint32_t rotate_right(uint32_t y) noexcept {
         uint32_t x = pool_.get(y).left;
         uint32_t T2 = pool_.get(x).right;
+
         pool_.get(x).right = y;
         pool_.get(y).left = T2;
+
+        // Correctly patch all parent metadata hooks to break cycle hazards
         pool_.get(x).parent = pool_.get(y).parent;
         pool_.get(y).parent = x;
         if (T2 != NIL) pool_.get(T2).parent = y;
+
         update_height(y);
         update_height(x);
         return x;
@@ -179,11 +183,15 @@ private:
     uint32_t rotate_left(uint32_t x) noexcept {
         uint32_t y = pool_.get(x).right;
         uint32_t T2 = pool_.get(y).left;
+
         pool_.get(y).left = x;
         pool_.get(x).right = T2;
+
+        // Correctly patch all parent metadata hooks to break cycle hazards
         pool_.get(y).parent = pool_.get(x).parent;
         pool_.get(x).parent = y;
         if (T2 != NIL) pool_.get(T2).parent = x;
+
         update_height(x);
         update_height(y);
         return y;
@@ -193,11 +201,15 @@ private:
         update_height(idx);
         int32_t balance = get_balance(idx);
         if (balance > 1) {
-            if (get_balance(pool_.get(idx).left) < 0) pool_.get(idx).left = rotate_left(pool_.get(idx).left);
+            if (get_balance(pool_.get(idx).left) < 0) {
+                pool_.get(idx).left = rotate_left(pool_.get(idx).left);
+            }
             return rotate_right(idx);
         }
         if (balance < -1) {
-            if (get_balance(pool_.get(idx).right) > 0) pool_.get(idx).right = rotate_right(pool_.get(idx).right);
+            if (get_balance(pool_.get(idx).right) > 0) {
+                pool_.get(idx).right = rotate_right(pool_.get(idx).right);
+            }
             return rotate_left(idx);
         }
         return idx;
@@ -207,6 +219,7 @@ private:
         while (idx != NIL) {
             uint32_t p = pool_.get(idx).parent;
             uint32_t new_sub_root = rebalance(idx);
+            
             if (p != NIL) {
                 if (pool_.get(p).left == idx) pool_.get(p).left = new_sub_root;
                 else pool_.get(p).right = new_sub_root;
@@ -215,7 +228,7 @@ private:
                 root_ = new_sub_root;
                 pool_.get(root_).parent = NIL;
             }
-            idx = p;
+            idx = p; // Safe scalar loop advance path
         }
     }
 
@@ -241,7 +254,6 @@ public:
     [[nodiscard]] [[gnu::always_inline]] inline size_t size() const noexcept { return size_; }
     [[nodiscard]] [[gnu::always_inline]] inline bool empty() const noexcept { return size_ == 0; }
 
-    // Purely Iterative Try Emplace: Immune to reference tracking bugs across allocations
     template <typename... Args>
     [[gnu::always_inline]] inline std::pair<MapNode*, bool> try_emplace(uint64_t key, Args&&... args) noexcept {
         if (root_ == NIL) [[unlikely]] {
@@ -270,7 +282,6 @@ public:
             }
         }
 
-        // Allocate the leaf node. Dynamic growth events here cannot invalidate loop lookups
         uint32_t fresh_idx = pool_.allocate(key);
         MapNode& fresh_node = pool_.get(fresh_idx);
         fresh_node.value = PrcLevelGeneric{std::forward<Args>(args)...};
@@ -379,6 +390,5 @@ public:
         return count; 
     }
 };
-
 
 
