@@ -1,3 +1,4 @@
+// Size: Exactly 64 bytes (1 CPU Cache Line)
 struct alignas(64) MapNode {
     uint64_t        key;        
     PrcLevelGeneric value;      
@@ -6,7 +7,7 @@ struct alignas(64) MapNode {
 };
 
 constexpr uint32_t CHUNK_SHIFT = 10;
-constexpr uint32_t CHUNK_SIZE  = 1U << CHUNK_SHIFT; 
+constexpr uint32_t CHUNK_SIZE  = 1U << CHUNK_SHIFT; // 1,024 elements (64 KB) per chunk
 constexpr uint32_t CHUNK_MASK  = CHUNK_SIZE - 1;
 
 class DynamicNodePool {
@@ -279,3 +280,5 @@ public:
         return count; 
     }
 };
+
+
