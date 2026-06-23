@@ -1,3 +1,63 @@
+template <typename Compare> class FastNodeMap;
+
+// Const-aware modern iterator policy wrapper
+template <typename Compare, bool IsConst = false>
+class MapIterator {
+private:
+    // Uses compile-time evaluation to select either a const or non-const map context
+    using MapType = std::conditional_t<IsConst, const FastNodeMap<Compare>, FastNodeMap<Compare>>;
+    
+    MapType* container_;
+    uint32_t idx_;
+
+public:
+    using iterator_category = std::forward_iterator_tag;
+    using value_type        = MapNode;
+    using difference_type   = std::ptrdiff_t;
+    
+    // Selects the appropriate pointer and reference types based on IsConst
+    using pointer           = std::conditional_t<IsConst, const MapNode*, MapNode*>;
+    using reference         = std::conditional_t<IsConst, const MapNode&, MapNode&>;
+
+    MapIterator(MapType* container, uint32_t idx) noexcept 
+        : container_(container), idx_(idx) {}
+    
+    [[nodiscard]] inline reference operator*() const noexcept { return container_->get_pool().get(idx_); }
+    
+    // MATHEMATICALLY CLEAN AND ERROR-FREE POINTER ACCESS
+    [[nodiscard]] inline pointer operator->() const noexcept { return &container_->get_pool().get(idx_); }
+    
+    inline MapIterator& operator++() noexcept {
+        idx_ = container_->next_index(idx_);
+        return *this;
+    }
+    inline MapIterator operator++(int) noexcept {
+        MapIterator tmp = *this;
+        idx_ = container_->next_index(idx_);
+        return tmp;
+    }
+    [[nodiscard]] inline bool operator==(const MapIterator& o) const noexcept { return idx_ == o.idx_; }
+    [[nodiscard]] inline bool operator!=(const MapIterator& o) const noexcept { return idx_ != o.idx_; }
+};
+
+public:
+    // Explicitly binds both safe variants
+    using iterator       = MapIterator<Compare, false>;
+    using const_iterator = MapIterator<Compare, true>;
+
+    [[nodiscard]] inline iterator begin() noexcept { return iterator(this, next_index(static_cast<uint32_t>(-1))); }
+    [[nodiscard]] inline iterator end() noexcept   { return iterator(this, static_cast<uint32_t>(pool_.capacity())); }
+    
+    [[nodiscard]] inline const_iterator begin() const noexcept { return const_iterator(this, next_index(static_cast<uint32_t>(-1))); }
+    [[nodiscard]] inline const_iterator end() const noexcept   { return const_iterator(this, static_cast<uint32_t>(pool_.capacity())); }
+
+
+
+
+
+
+
+
 // Size: Exactly 64 bytes (1 CPU Cache Line)
 struct alignas(64) MapNode {
     uint64_t        key;        
