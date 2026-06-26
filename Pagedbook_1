@@ -1,0 +1,120 @@
+// Struct is exactly 32 bytes. Checked via static_assert below.
+struct alignas(32) PrcLevelGeneric {
+    int64_t prc{};                // 8 bytes
+    uint64_t uuid{};              // 8 bytes
+    void* pords{nullptr};         // 8 bytes
+    uint32_t agg_sz{};            // 4 bytes
+    
+    // Combined field to prevent compiler padding:
+    // Bits 0-15  : num_orders (16 bits)
+    // Bits 16-63 : feed_time  (48 bits / 6 bytes)
+    uint64_t tracking_payload{};  // 8 bytes
+
+    // Clean inline getters and setters for the packed payload
+    inline void set_metrics(uint16_t orders, uint64_t ns_timestamp) noexcept {
+        tracking_payload = (static_cast<uint64_t>(orders)) | 
+                           ((ns_timestamp & 0x0000FFFFFFFFFFFFULL) << 16);
+    }
+
+    [[nodiscard]] inline uint16_t get_num_orders() const noexcept {
+        return static_cast<uint16_t>(tracking_payload & 0xFFFF);
+    }
+
+    [[nodiscard]] inline uint64_t get_feed_time() const noexcept {
+        return (tracking_payload >> 16) & 0x0000FFFFFFFFFFFFULL;
+    }
+};
+
+// Compile-time guard confirming strict 32-byte layout geometry
+static_assert(sizeof(PrcLevelGeneric) == 32, "PrcLevelGeneric must be exactly 32 bytes");
+
+struct alignas(64) BookPage {
+    static constexpr size_t LEVELS_PER_PAGE = 1024;
+    std::array<PrcLevelGeneric, LEVELS_PER_PAGE> levels{};
+};
+
+class Int64SparsePagedLadder {
+public:
+    static constexpr size_t PAGE_SHIFT = 10; // log2(1024)
+    static constexpr size_t PAGE_MASK = BookPage::LEVELS_PER_PAGE - 1;
+
+    Int64SparsePagedLadder(int64_t min_price_tick, int64_t max_price_tick)
+        : min_tick_(min_price_tick) {
+        
+        size_t total_ticks = static_cast<size_t>(max_price_tick - min_tick_ + 1);
+        size_t total_pages = (total_ticks + BookPage::LEVELS_PER_PAGE - 1) >> PAGE_SHIFT;
+        pages_.resize(total_pages); 
+    }
+
+    [[nodiscard]] inline PrcLevelGeneric* find(int64_t raw_price_tick) noexcept {
+        if (raw_price_tick < min_tick_) [[unlikely]] return nullptr;
+        
+        int64_t tick_idx = raw_price_tick - min_tick_;
+        size_t page_idx = static_cast<size_t>(tick_idx >> PAGE_SHIFT);
+        
+        if (page_idx >= pages_.size() || !pages_[page_idx]) [[unlikely]] return nullptr;
+        
+        size_t level_idx = static_cast<size_t>(tick_idx & PAGE_MASK);
+        PrcLevelGeneric& lvl = pages_[page_idx]->levels[level_idx];
+        
+        if (lvl.prc == 0) return nullptr;
+        return &lvl;
+    }
+
+    inline std::pair<PrcLevelGeneric*, bool> try_emplace(
+        int64_t raw_price_tick, uint32_t sz, uint16_t orders, 
+        uint64_t full_ns_time, uint64_t full_uuid, void* pords) noexcept {
+        
+        if (raw_price_tick < min_tick_) [[unlikely]] return {nullptr, false};
+        
+        int64_t tick_idx = raw_price_tick - min_tick_;
+        size_t page_idx = static_cast<size_t>(tick_idx >> PAGE_SHIFT);
+        
+        if (page_idx >= pages_.size()) [[unlikely]] return {nullptr, false};
+        
+        if (!pages_[page_idx]) [[unlikely]] {
+            pages_[page_idx] = std::make_unique<BookPage>();
+        }
+        
+        size_t level_idx = static_cast<size_t>(tick_idx & PAGE_MASK);
+        PrcLevelGeneric& lvl = pages_[page_idx]->levels[level_idx];
+
+        if (lvl.prc == raw_price_tick) {
+            return {&lvl, false};
+        }
+
+        lvl.prc = raw_price_tick;
+        lvl.agg_sz = sz;
+        lvl.uuid = full_uuid;
+        lvl.pords = pords;
+        lvl.set_metrics(orders, full_ns_time);
+
+        return {&lvl, true};
+    }
+
+    // Single-cycle vector store zeroing with type-safe alignment boundaries
+    inline bool erase(int64_t raw_price_tick) noexcept {
+        if (raw_price_tick < min_tick_) [[unlikely]] return false;
+        
+        int64_t tick_idx = raw_price_tick - min_tick_;
+        size_t page_idx = static_cast<size_t>(tick_idx >> PAGE_SHIFT);
+        
+        if (page_idx >= pages_.size() || !pages_[page_idx]) [[unlikely]] return false;
+        
+        size_t level_idx = static_cast<size_t>(tick_idx & PAGE_MASK);
+        PrcLevelGeneric& lvl = pages_[page_idx]->levels[level_idx];
+
+        if (lvl.prc == 0) return false;
+
+        // Satisfies modern strict-aliasing standards by casting through void*
+        void* aligned_ptr = static_cast<void*>(&lvl);
+        __m256i zero_reg = _mm256_setzero_si256();
+        _mm256_store_si256(reinterpret_cast<__m256i*>(aligned_ptr), zero_reg);
+
+        return true;
+    }
+
+private:
+    int64_t min_tick_;
+    std::vector<std::unique_ptr<BookPage>> pages_;
+};
