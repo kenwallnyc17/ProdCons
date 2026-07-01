@@ -1,0 +1,3 @@
+_mm_pause()
+_mm_prefetch()
+avx_scan_types
