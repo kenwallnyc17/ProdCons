@@ -59,9 +59,13 @@ public:
         Value        vals[CAP];
     };
 
-    // Trivial constant-initialisation: all members zero/null. In static storage
-    // this is done at load with no code, and every block is already empty.
-    constexpr StaticBucketedOrderIdMap() noexcept = default;
+    // Trivial default constructor: writes NOTHING. A zeroed StaticBucketed map
+    // IS a valid empty map (empty tag 0, count 0, next null, all cursors 0), so
+    // it must live in zero-initialised storage — static/BSS (zero-filled at
+    // load) or an mmap'd region (kernel-zero-filled). This is what lets the
+    // hugepage placement factory construct in-place without touching the
+    // multi-GB directory: no giant memset, pages commit lazily / on populate.
+    StaticBucketedOrderIdMap() noexcept = default;
 
     StaticBucketedOrderIdMap(const StaticBucketedOrderIdMap&)            = delete;
     StaticBucketedOrderIdMap& operator=(const StaticBucketedOrderIdMap&) = delete;
@@ -228,13 +232,13 @@ private:
     }
 
     // Fixed storage. Lives in zero-initialised static (or anonymous-mmap) memory.
-    alignas(64) Block dir_[kBuckets]{};
-    Block             pool_[kPool]{};
-    Block*       free_head_       = nullptr;
-    std::size_t  pool_high_       = 0;   // bump cursor into pool_
-    std::size_t  pool_free_count_ = 0;   // blocks currently on the freelist
-    std::size_t  size_            = 0;
-    std::size_t  insert_failures_ = 0;
+    alignas(64) Block dir_[kBuckets];
+    Block             pool_[kPool];
+    Block*       free_head_;
+    std::size_t  pool_high_;        // bump cursor into pool_
+    std::size_t  pool_free_count_;  // blocks currently on the freelist
+    std::size_t  size_;
+    std::size_t  insert_failures_;
 };
 
 }  // namespace md
