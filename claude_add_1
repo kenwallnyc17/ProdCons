@@ -1,0 +1,10 @@
+ there's exactly one legitimate micro-vectorization, and it's a store-coalesce, not a compute: feed_time and uuid are two adjacent 8-byte fields, so if tk and prclvl both lay them out contiguously in the same order, copy both as one 16-byte move:
+cppstatic_assert(offsetof(PriceLevel,uuid) - offsetof(PriceLevel,feed_time) == 8);
+static_assert(offsetof(Tick,      uuid) - offsetof(Tick,      feed_time) == 8);
+_mm_storeu_si128(reinterpret_cast<__m128i*>(&prclvl.feed_time),
+                 _mm_loadu_si128(reinterpret_cast<const __m128i*>(&tk.feed_time)));
+That replaces two 8-byte loads + two 8-byte stores with one 16-byte load + store — but be honest with yourself about the payoff: modern store buffers already coalesce adjacent stores, so the measured win is often near zero, and it does nothing about the cache miss that actually costs you. I'd only keep it if a benchmark shows it, and I don't expect it to.
+The levers that do move this update's latency, in order:
+Lay PriceLevel so the fields you touch on the hot path — agg_sz, num_orders — sit together at the front, so the update is a single cache-line write. Everything cold (or provenance, if it stays) goes after.
+Prefetch the level the moment idx is known. The miss on prclvl is the real cost, so if try_emplace can hand you the address slightly before you need it, issue a _mm_prefetch(&book.prc(idx), _MM_HINT_T0) and let the load overlap with whatever follows. That's worth more than any arithmetic change here.
+Keep the new_insert branch as-is — it's correct (the emplace constructor already seeded agg_sz=sz, num_orders=1 for the new-level case, so you rightly skip the +=), and it's well-predicted since existing-level is the common case in a liquid book.
