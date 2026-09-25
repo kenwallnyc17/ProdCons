@@ -1,0 +1,18 @@
+I have a new one for you in the market data space. It's a hybrid raw market data feed handler and database. 
+The incoming L1 feed (top of book feed, perhaps SIP BBO and NBBO) packets need to be stored in raw format for 
+later retrieval and on the fly decode and publish to a client. As the packets come in we need to decode enough 
+to retrieve the symbol (or symbol/locate index) this will be used to determine a message queue in which the 
+individual packet msg will be stored. Lets call the decoder a linehandler (LH) which has K spsc queues with 
+fixed size elements of maximum msg size. This spsc queue can grow by adding chunks as needed from a preallocated 
+pool of chunks with dynamic heap allocation as the last resort. As each packet msg is decoded for the symbol it 
+determines the kth spsc queue in which to append the msg. The symbol to kth queue mapping has to be stored in a 
+SymQMap for later use. There will be multiple LH's each with K spsc queues, so SymQMap should map symbol to global 
+Qmap index (global spsc queue index). As each spsc queue is appended to it tracks the current append index within 
+the queue. Every N seconds (say N=10 seconds) the current kth queue index needs to be written to a global container 
+that holds index within the kth queue (call this QToTimeIdx - handles the global spsc queue index). So, the flow 
+will be: A TCP client comes in with symbol and start time. The symbol goes into SymQMap to get the global spsc 
+queue and with the start time you use QToTimeIdx to get the approximate location within the globally indexed spsc 
+queue. The client handler can then go into this spsc queue location and move forward or backward to get the closest 
+incoming raw msg to the provided start time. And from that point take the raw msgs and decode them and send them to 
+the TCP client, moving forward in time. After the decoding and publishing of the stored raw msgs has completed, it 
+will wait for new msgs to come into the current spsc queue for the symbol of interest and decode and publish those.

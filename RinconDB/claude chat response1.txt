@@ -1,0 +1,43 @@
+Build with g++ -std=c++23 -O3 -march=sapphirerapids -pthread main.cpp (or -march=znver4/znver5). The self-test ran two LHs on a synthetic feed. A TCP client then connected 1.5 s in and asked for history from t0+0.5 s, with a seed. The client received exactly the ground-truth message count for its symbol, with no foreign symbols and non-decreasing timestamps. The test passes clean under TSan. My sandbox has GCC 13.3, but nothing in the code needs 14.2.
+
+Where I changed your design
+
+These aren't really SPSC queues. Nothing ever pops a record, and many client handlers read each queue at once. So each queue is an append-only, single-writer, multi-reader log that grows by chunks (MsgQueue). That turns out to simplify things:
+
+Replay and live tail are the same loop. The client scans [cur, committed()), and once caught up it just keeps polling committed().
+A slow client can never be overrun, and it can never back-pressure the LH.
+
+The chunk directory is a fixed array per queue, so growth never moves memory a reader might be holding. A queue grabs its next chunk from the pool when it is half through the current one, which keeps chunk rollover off the critical path.
+
+K queues per LH means many symbols share each queue. So each record has to carry its symbol, and replay has to filter. I split each chunk into three parallel arrays: ts[] (u64), symid[] (u32), and the fixed-size records. Filtering then runs on symid[] alone, 16 records per AVX-512 compare, without touching record memory. Scanning a billion records reads about 4 GB of sidecar, which is bandwidth-bound. I chose contiguous loads over gathering from a strided header.
+
+symid is simply the entry's slot index in SymQMap. It is dense and stable, so no separate counter is needed.
+
+QToTimeIdx is written by the LH, based on feed time, with no timer thread. When a packet's receive time crosses a bucket boundary, the LH records each of its K queues' write index before appending. That gives idx[b] = the first record with ts ≥ bucket start. Quiet periods are gap-filled.
+
+Finding the start point is exact, not "step forward or backward." The client:
+
+Takes the bucket's range [idx[b], idx[b+1]) from QToTimeIdx.
+Binary-searches ts[] within that range.
+
+This depends on per-LH time being non-decreasing, so the LH clamps rx = max(rx, last_rx). Stamp after A/B arbitration.
+
+The "backward" part is still useful, as a seed. For L1, a client starting at T usually wants the prevailing BBO/NBBO at T. That may be a message well before T for an illiquid name. SEED=1 runs a bounded backward SIMD scan (find_prior) and sends that one message first.
+
+SymQMap
+
+Keys are 16 bytes, holding up to 16 characters. On ingest, one masked AVX-512 load normalizes space padding to NUL, and it can't over-read the RX buffer.
+
+The table is linear-probed over 4-slot groups. The four keys fill one cache line and are matched with a single _mm512_cmpeq_epi64_mask. The values sit on the adjacent cache line.
+
+Inserts claim a slot by CAS on the value word, write the key, then release the value. This assumes a symbol is owned by exactly one LH (channel partitioning), which holds for CQS/UQDF. LineHandler::pin() lets you bin-pack symbols to queues pre-open, e.g. by prior-day volume, instead of the default round-robin. That matters because replay cost scales with the queue's total volume, not the symbol's.
+
+Other SIMD use
+
+Records are written as whole cache lines. The header is merged into the first zmm, and the payload comes in through fault-suppressed masked loads, so nothing reads past the message.
+
+Things to decide
+Memory. At 128 B per record plus 12 B of sidecar, you need about 140 GB per billion stored messages. If your longest L1 message fits in 56 bytes, Layout<64,…> roughly halves that. Beyond RAM, chunks could be file-backed mmaps on NVMe with no change to the reader logic.
+Wire format. toy_l1.hpp is a stand-in with the shape of a SIP quote feed. Drop in the real CTA/UTP offsets, byte order, and message types. Only for_each_msg and decode touch the wire.
+Client handling. Clients get one thread each here. In production, use an epoll pool on non-isolated cores. The LH hot path has no syscalls, locks, or allocation; the heap is touched only if the pool is exhausted, and that path is marked cold.
+ASan. ASan's fake-stack mode (detect_stack_use_after_return) faults on a compiler-over-aligned local in the decode path. With that option off, ASan passes cleanly. That's a known sanitizer alignment quirk, not a bug in the code.
