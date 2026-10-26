@@ -1,0 +1,4 @@
+# ThreadSanitizer suppressions.  TSAN_OPTIONS=suppressions=tsan.supp ./binary
+# SymQMap::find reads a group's four keys with one SIMD load while an LH may be writing a new
+# key into that group. Intentional: the value is acquired and the key rechecked before use.
+race:rawmd::SymQMap::find
