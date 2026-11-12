@@ -1,0 +1,39 @@
+The review found four defects and two latency problems in the last delivery; all are fixed and re-verified. Nothing you asked for was missing, but (a) and (b) were each wrong in specific situations and the decode-stage prefetch never ran. The host API is unchanged apart from a new, optional JoinTactic::prefetch.
+
+Defects
+
+(b) fired while switched off. After set_params with abandon_pct < 0, resting orders stayed armed and the ratio test passed, so an order reaching the front was cancelled as abandoned.
+(b) counted round lots that no longer were. Flags were only ever added, so a market order flagged for one of our orders and later cut below a round lot still counted for our next one. Against a per-order model this gave a false (b) in 106 of 3,000 random streams with one of our orders resting at a time; now none.
+Size-up build: (a) ignored our own growth. One of our orders growing in place was not re-checked for ours behind it.
+prefetch(sym) did nothing. g++ treats a function that only prefetches as free of side effects and deletes any call it did not inline. Every call site I tried compiled to nothing.
+
+The first three have regression tests that fail on the delivered headers.
+
+Latency
+
+TSC, median	Delivered	Now
+Message for a symbol with no orders of ours (Add / Delete / Execute)	14 / 12 / 12	10 / 10 / 10
+One order of ours	34 / 32 / 50	30 / 30 / 40
+One order, (b) armed	34 / 38 / 56	30 / 34 / 42
+Same, message at our price	32 / 52 / 60	30 / 48 / 54
+(d) cancel to callback, (b) armed	79	69
+(c) cancel to callback, (b) armed	97	87
+Cold (d) cancel to callback, host calling prefetch(sym)	229	75
+Handler frame. With one call site per entry point, the compiler inlined the passes and join kernels into the handler, which then realigned its stack on every message. Nothing holding a 256-bit value is inlined into the handler now, and a symbol with at most two orders a side runs scalar passes that need no aligned frame.
+(b) on every removal. Every removal on a symbol with an armed order called the (b) pass. An inline price compare (about 4 TSC) now gates it.
+Prefetch. It is now forced inline, and the join tactic has one too. The 75 needs your NBBO record prefetched as well; with the tactic’s prefetch alone it is 173.
+
+What I had wrong last time. The bench never armed (b) or passed removal flags, so its default-configuration figures were low, and its prefetch rows measured nothing. Bench parts 11–14 and the new mdsys_2_host_bench.cpp close that.
+
+Costs. on_place is now a call: 60–62 TSC, up from 54–60. With eight armed orders on a side, an execution costs about 6 TSC more (66 → 72).
+
+Compiler. This machine has g++ 13.3, not your 14.2. What gets inlined is the compiler’s choice, so the header now forces it on these paths. The host bench’s header comment has a one-line check to run on your build.
+
+Verification. 720 checks pass in eight build configurations. (a), (b) and the join tactic match brute-force models written from the requirements, and all 151 behaviour-changing mutants are caught.
+
+Yours to decide. Section E.6 of cancel_tactic.pdf lists ten readings where the requirements leave a choice. The four I would look at first:
+
+Shared flags. Two of our orders at one price share the round-lot flags ahead of the first. That still gives a false (b) in 61 of 3,000 streams with several of ours per price. Exact per-order sets need the departing order’s queue handle passed with each removal.
+Queue order for (b). A later order of ours counts as at the front only once the earlier one has left the book.
+Our own orders in (a). Ours ahead count toward N and K like any other order.
+Partly filled, then cancelled. A round lot ahead that trades in part and cancels the rest counts as cancelled.
