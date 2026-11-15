@@ -1,0 +1,167 @@
+Now read the sheet back to check that the rows landed where intended.
+
+The final measurement pass is finished and the code is settled; I’m now waiting on the mutation run over the final files (365 mutants, about an hour on this machine) and a sanitizer build. Nothing is delivered yet.
+
+Where things stand:
+
+Trigger (b) and late marking (on_place_late plus the journal) are implemented; the suite is at 1,035 checks, all passing at -O2 -Werror.
+Journal default raised to 128 entries per symbol (was 64), so that “tens” of updates are covered even when many of them move the NBBO. It only bounds the replay, so no update pays for it.
+Replay tightened: it now stops at the order’s own Add and revisits only the updates at the order’s price. Called straight after the Add it costs about 100 TSC, then 8–16 per journal entry since.
+Hot path unchanged by those two edits: the handler’s machine code is identical to the version measured.
+Limitations sheet updated: eight new rows for (b) and late orders, and refreshed figures for memory, pinned cost, deep queues and check count.
+
+Still to do once the mutation run reports:
+
+Add tests for any mutant that changes behaviour and is not caught.
+Run the 12-configuration build matrix on the final files.
+Fill the verification paragraph, rebuild cancel_tactic.pdf, and send the six files with the summary and the readings to confirm.
+Mdsys 2
+HPP
+
+The sanitizer build of the current files is clean: 1,035/1,035 checks under ASan and UBSan, no reports. The mutation run is at 40 of 365 and now has both cores, so it should finish in roughly 40 minutes; the build matrix, the verification paragraph and the delivery follow it.
+
+are you done
+
+Not yet — about 30–40 minutes of machine time left, and nothing has been sent.
+
+Done: the code for both changes, the final measurements, the tests (1,035 checks, also clean under ASan and UBSan), and the limitations sheet.
+Running now: the mutation run. The reduced test has been through 364 of the 365 mutants and caught all but 23; those 23 now go through the full test, about 10 minutes. Several of them are SIMD-only mutants the reduced test cannot see, and at least four of the others are aimed at by tests I added after this run’s copy of the test file was taken.
+After that:
+Add a test for any mutant that changes behaviour and still gets through.
+Run the 12-configuration build matrix on the final files, about 10 minutes.
+Fill the verification paragraph in cancel_tactic.pdf.
+Send the six files with the summary and the readings to confirm.
+
+The mutation run is finished and the build matrix is running (about ten more minutes); I’ll send the files as soon as it reports.
+
+The mutation result is weaker than I expected: 348 of 365 seeded mutants are caught. Of the 17 that are not:
+
+Six cannot change behaviour, by my reading of the code: redundant clears, a switch test nothing reaches, and defensive checks.
+Eleven do change behaviour and no test catches them yet. All are in the late-order paths, and most concern several of our orders at one price or the bookkeeping after a decision made at a late call.
+
+The PDF’s verification paragraph lists them as they are. They are gaps in the tests, not known defects in the code, but they mark the paths I have the least evidence for.
+
+Done: both changes are in and the six files are sent. The suite passes in all 12 build configurations (1,035 checks), but 11 seeded mutants in the late-order paths get past the tests; details under Verification.
+
+Trigger (b)
+Only our leading order at a price is judged. When it is at the front or has only odd lots ahead, and more than X% of the round lots ahead of it at placement have cancelled, every live order of ours at that price gets CancelAbandoned on that update.
+An order of ours behind it is never judged on its own while the leading one rests; it takes over when that one leaves the book.
+Orders recognised late
+Call on_place_late(id, sym, side, px, qh, callback, &info) instead of on_place. The tactic journals every update of tracked symbols in one 512 KB ring, finds the order’s own Add, and replays (b) and (d) from there. Whatever would have been decided since is decided at the call.
+With one of our orders at a price, the result equals registering at the Add: 0 differences over about 17,000 late orders in random streams, up to 60 events late.
+With several of ours at a price it is not exact: until the call the others treat the unknown one as a market order (351 of 5,201 such orders decided differently in the random test).
+
+What the host must do:
+
+Pin the symbols with set_tracking(sym, true) before orders arrive.
+Pass the QEv from push_ev / remove_ev / reduce_ev / grow_ev with each update.
+Call on_book_push for an order that enters a queue by a Replace.
+Cost
+
+TSC ticks, 100 = 43 ns; VM with g++ 13.3, not GCC 14.2 on the 6745P.
+
+Path	Now	Without the journal
+Untracked symbol, per message	10	10
+Pinned symbol, no orders (Add / Delete / Execute)	18 / 18 / 24	14 / 14 / 22
+One order of ours	32 / 30 / 44	30 / 30 / 40
+Cold update, both prefetches	42–62	40–58
+(d) / (c) / (b) cancel to the callback	75 / 89 / 81	71 / 85 / 73
+on_place_late: about 100 straight after the Add (on_place is 66), then 8–16 per journal entry since: 140–185 after 8 updates, 380–630 after 32, 600–1,060 after 60. An order whose Add is out of reach costs about 1,100 and is then tracked from the call.
+One ring, not one per symbol: a ring per symbol cost every cold update one more cache line (44–80 TSC, p99 doubled). The trade is a replay that walks back one dependent load per entry.
+Verification
+Builds: all 12 configurations pass, including ASan + UBSan, clang -O3, AVX2-only and SSE2-only, size-up, and the journal off, at 64 and at 256 entries. Sanitizers ran with g++ only; clang’s runtime is not installed here.
+Mutants: 348 of 365 are caught. Six of the other 17 cannot change behaviour by my reading. Eleven do and are not caught yet:
+(b) left armed on an order already decided, by (c) or at a late call (two mutants);
+the hysteresis record and the counts after a decision at a late call;
+(d) seeded from a join signal raised after the order’s Add;
+which of two level decisions on updates is taken;
+the journalled size after a change;
+four in how a late order’s counts are settled against others of ours at its price.
+These are test gaps, not known defects. The PDF’s verification paragraph lists them.
+Readings to confirm
+A leading order with no round lot ahead at placement, an odd-lot one, or one whose cancel is in flight holds (b) back for ours behind it.
+For a late order, (a), the (d) queue gate and (c) are judged at the call; only (b) and (d) are replayed from the Add. When its own (b) is found at the call, orders of ours placed at that price since go with it.
+The journal reaches back 16,384 updates across all tracked symbols together, and 128 entries of the order’s own symbol. Past that the order is tracked from the call, and late_unanchored() counts it. Both are compile-time knobs (MD_CANCEL_JOURNAL_RING, MD_CANCEL_JOURNAL).
+
+The limitations sheet has eight new rows for these. I also replaced its outdated figures for memory, pinned cost, deep queues and check count.
+
+Say if you want me to close the eleven test gaps next.
+
+I’ll review the delivered code with fresh eyes, concentrating on what changed: the new (b) logic, the journal, on_place_late and its replay, and the new queue queries. I’ll confirm each suspected defect with a small repro before reporting it.
+
+I found nothing high-severity: trigger (b) does what we agreed, and nothing on the hot path decides wrongly. I did find four low-severity defects in on_place_late, each confirmed with a small repro. The journal also costs more per message than I reported when the tactic’s state is cold in L3, and two of the 11 “uncaught” mutants I listed turn out to be harmless.
+
+Findings, most important first
+
+1. The journal costs about twice as much when state is cold (performance, medium).
+
+I timed 16,384 pinned symbols with no orders, visited in random order and prefetched two messages ahead, over blocks of 4,096 messages.
+The journal adds 6–8 TSC a message cold (about 23 → 30, +33%), against +4 hot (9.7 → 13.5) in the same harness.
+The cold figure I gave you came from timing one call at a time, which hides most of this; the throughput runs I did were hot.
+Cache misses are not the cause. A ring small enough to stay in L1 changed nothing, and neither did keeping the per-symbol chain heads in L1. Writing the entry as two 16-byte stores instead of eight changed nothing either.
+My best explanation is that the ~30 extra instructions and stores cost more while the loop waits on memory. I haven’t found a cheaper way to write the entry, so this should be measured on the 6745P before deciding anything.
+
+2. An out-of-reach late order doesn’t kill its own join signal (doc/code mismatch).
+
+The header comment at mdsys_2.hpp:1867 says the kill flag is set “whether or not the Add is found”.
+The out-of-reach path (1942–1946) returns before the signal check. Repro: in reach, kill = 1; out of reach, kill = 0.
+The check can’t be done safely without the Add’s timestamp, so I’d correct the comment rather than guess which signal is ours.
+
+3. A hidden execution at the order’s price loses the anchor.
+
+An Execute that touched no queue arrives with no order handle, and the replay gives up on any unnamed update at its price (mdsys_2.hpp:2527). The order is then tracked only from the call.
+Fix: skip unnamed updates that carry no queue flags and aren’t Adds. That is safe as long as the host passes the QEv for every queue call, as the contract already requires.
+
+4. Size-up build only: recognising an order can wrongly disarm one of ours behind it.
+
+This applies only with MD_SIZE_UP_KEEPS_PRIORITY=1. The correction in uncount (2569–2582) assumes sizes never grow.
+Repro: our unknown order X starts as an odd lot and grows in place into a round lot. Of ours behind it, A was placed before the growth and B after. When X is recognised, A’s count drops 1 → 0 and A is disarmed, though A never counted X.
+It’s narrow, but A then never gets (b).
+
+5. Registering the same order twice gives two lanes and two cancels.
+
+Repro: two on_place_late calls for one order give two handles, live_orders = 2, and two callbacks from one (d) event.
+Two sources reporting “this is ours” is plausible for late recognition. Fix: one bit test, return the existing handle if the queue slot is already tracked (same in on_place).
+
+6. An unstated precondition.
+
+The order must still rest at that queue handle when on_place_late is called. If it has already left the book, the first queue lookup is undefined behaviour in an NDEBUG build.
+Since “tens of events” late is exactly when a fill can come first, the header should say this.
+Corrections to my last report
+Mutants: of the 11 I called behaviour-changing, two aren’t. Dropping the journalled “size after” cannot change a decision without in-place growth. Seeding (d) from a signal raised after the Add is cancelled out by a clamp. The PDF’s verification paragraph is wrong on both.
+Test gaps that matter most:
+A decided leading order left armed. The code clears the arm correctly after (c) and after a late call, but no test fails if it doesn’t. If it didn’t, the orders behind would be cancelled.
+A (c) decided at a late call not recording the re-entry threshold replace_allowed checks.
+The counts after an (a) decided at a late call.
+Sheet: the journal-cost row needs the cold figure from finding 1.
+Checked and sound
+The (b) leading-order logic and level-wide cancel match the agreed reading, including decided, odd-lot and no-count leading orders.
+The replay’s byte-sized indices are safe up to a journal of 256. The ring’s overwrite test is right, and the walk stops correctly at breaks, at a removal of the same queue slot, and on a link longer than 65,535.
+The new queue queries agree with the reference model.
+
+Repros are in /tmp/claude-0/-home-claude/c1a794c2-ba06-58ec-baf5-2da742bb92b9/scratchpad/rv/repro.cpp and the timing harness is /tmp/claude-0/-home-claude/c1a794c2-ba06-58ec-baf5-2da742bb92b9/scratchpad/rv/coldthru.cpp. Should I fix findings 2–6, add the missing tests, and correct the PDF and sheet?
+
+what do you mean by 'replay of orderbook removals for late arrivals'?
+
+“The replay” is what on_place_late does when the host tells it late that an order is ours. It doesn’t re-apply anything to the book. It reads back the tactic’s own journal of recent book updates and works out the state the order would have had if on_place had been called at its Add.
+
+Why it’s needed. Between the order’s Add and the late call, the tactic treated the order as a market order, so it kept no state for it:
+
+(b) never saw which round lots were ahead of it, or which of them later cancelled.
+(d) never counted the executions above its price.
+(c) never took the NBBO at its Add as its baseline.
+
+What makes it possible. Every book update of a tracked symbol writes a 32-byte journal entry: the event, side, price, the queue handle of the order it touched, that order’s size before and after, its flags and the timestamp. NBBO changes and (b) cancels of a whole price level get entries too.
+
+What the replay does at the late call:
+
+It walks back through that symbol’s entries until it finds the order’s own Add, matched by its queue handle.
+It goes forward over the updates at the order’s price since the Add. Orders added there after ours are behind it. Each order that was ahead and left counts as either a cancellation or a fill, and its size at our Add says whether it held a round lot.
+From that it rebuilds the counts each trigger needs. For (b): round lots ahead at the Add and how many of them cancelled. For (d): executions above its price. For (c): the NBBO at the Add.
+It finds the first entry where a trigger would have fired, if any, and makes that decision now. It also keeps the counts exactly as they stood at that decision.
+
+Example at 99.00. Round lots R1 and R2 are resting; our order L arrives unrecognised; R1 cancels; R2 cancels; then the host learns L is ours.
+
+The replay finds L’s Add and sees two round lots ahead of it, both gone by cancellation. After R2’s removal L was at the front with 2 of 2 cancelled, so (b) held at that entry. L is cancelled at the call, together with any other order of ours at 99.00.
+
+What “the replay gives up” meant in the review. If an update at the order’s price arrives without the touched order’s handle, the replay can’t tell whether that order was ahead or behind ours. It then stops, and the order is tracked from the call as on_place would. A hidden execution at that price is one such update, which is finding 3.
