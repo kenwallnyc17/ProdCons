@@ -1,0 +1,181 @@
+I think that this is going to be too complicated and not low latency as needed. We will have hundreds of tactics running on 1 core/thread. we need to simplify. how about a version that instead   of starting to store orders at the time of the join trigger, we wait until our orderid is received back into the system (after the acknowledgement from the exchange on order entry which contains the ID). then we just do our best to approximate the data for the cancel triggers.
+
+I�ll rework it that way: no journal and no replay. An order is registered when its ack arrives, using approximate counts taken from the book as it stands. First I�ll save the journal version so nothing is lost, then check how on_place behaves when called after the Add.
+
+Agreed. This drops both costs: the journal tax on every update of a tracked symbol (about +4 TSC hot, +6�8 cold), and the replay of up to about 2,000 TSC per late order on the feed thread.
+
+How it will work
+
+Ack arrives before the Add: the host calls on_place when the Add arrives. This is exact, as today.
+Add arrives before the ack: the host calls on_place_late at the ack, passing the Add�s timestamp from its order table. The order is tracked from then. This is one fixed-cost call, about what on_place costs, however late the ack is.
+
+What is approximated when the ack comes late
+
+(a) and (c): judged on the queue and NBBO as they stand at the ack.
+(b): counts the round lots ahead at the ack, and counts their cancels from then on.
+Cancels before the ack are lost.
+Fills before the ack also drop out of the count, so (b) can fire later or earlier than it would have.
+An order that is already at the front, or has only odd lots ahead, when the ack arrives has nothing to count. It never gets (b), and it holds back (b) for any of ours behind it.
+(d): seeded from the join signal if it is still live, meaning the executions above our price since the signal. Otherwise it counts from the ack. So the strategy should kill the signal after the ack, not when it sends the order.
+
+What stays and what goes
+
+Kept: the (b) leading-order rule. The fix for ours behind it that had counted it as a market round lot. Killing a join signal raised by our own order, matched by price and the Add�s timestamp.
+Removed: the journal and replay, the QEv calls, and on_book_push. The host passes plain queue flags again. The hot path goes back to its pre-journal cost, with the new (b) logic kept.
+
+One question. By �hundreds of tactics on one core�, do you mean hundreds of our orders handled by one cancel/join tactic instance for the whole book? That is what the code is built for: up to 8 orders per symbol side, one parameter set. Or do you mean hundreds of separate tactic instances, each with its own N/K/X/T and possibly sharing symbols? The second also needs per-tactic parameters, and memory sized to each tactic�s symbols. Today every instance carries state for all 16,384 symbols, about 23 MiB. I�m starting the simplification now, and the answer only affects a follow-on change.
+
+Compacted conversation
+
+the first.
+
+Late orders are now registered at the exchange�s ack and the journal is gone. The tests and all eight build configurations pass, and the final timing run is going now; the PDF can�t be finished until it ends. I�ll pick up from there, and you�ll get the files once the PDF is rebuilt.
+
+I’ve removed the journal. An order whose Add arrives before its ack is now registered at the ack, using the book and NBBO as they are then, and no book update pays anything for it.
+
+How it works. At the ack the host calls on_place_late(id, sym, side, px, t_add, qh, cb, &info), with the Add’s timestamp and the order’s queue handle. If the ack comes first, nothing changes: on_place at the Add, as before.
+
+(a) is judged on the queue as it stands at the ack.
+(b) counts the round lots ahead at the ack, and their cancellations from then on.
+(c) measures how far the market has moved from the NBBO at the ack.
+(d) starts from the join signal the order answered, if that signal is still live; otherwise from the ack.
+Two corrections at the ack. Our orders behind it stop counting it as a market round lot. If the order raised its own join signal, that signal’s kill flag is set.
+Removed: the ring, the replay, the QEv overload, on_book_push, the queue’s *_ev calls, late_unanchored(), and the two journal build options and template parameters. That is about 580 fewer lines.
+
+Cost (TSC, hot, medians; 100 TSC = 43 ns):
+
+	This version	With the journal
+Message, pinned symbol (Add / Delete / Execute)	14 / 14 / 20	18 / 16 / 22
+Message, one order of ours	28 / 28 / 36	30 / 28 / 40
+Message, timed in blocks	2–4 less	—
+(d) / (c) decision to callback	65 / 79	71 / 83
+on_place_late	66–82	—
+on_place	56–64	—
+Update path: the handler’s machine code is the same as the journal version built with the journal compiled out.
+on_place_late: costs the same however late the ack comes.
+
+What you lose by registering at the ack. I measured this on random streams that are much busier at our price than a real book, so read it as a stress test. Acks came 1–60 updates after the Add.
+
+Not yet decided at the ack: 91% of orders get the same first decision on the same update. That is 98% for acks within 4 updates and 86% at 33–60.
+Already decided before the ack: this is 31% of orders, and it is where the real loss is.
+(a) is caught at the ack 61% of the time.
+(d) is caught every time, via the join signal.
+(b) and (c) are never caught at the ack, because their counts start there.
+mdsys_2_late_approx.cpp reproduces these numbers. Run it with your own parameters, or on a recorded feed with its real ack delays.
+
+What the host must do.
+
+Call on_place_late at the ack, and skip orders that left the book before their ack.
+Kill a join signal only after the acks of the orders placed on it.
+
+Testing. All 853 checks pass in all 8 build configurations (sanitizers, -O0, clang, AVX2-only, SSE-only, size-up). Of 200 deliberately injected bugs, 197 are caught. The other 3 can’t change behaviour. Five of them initially slipped through, so I added tests for them.
+
+Readings to confirm: cancel_tactic.pdf, section E.6, has four new rows: (b), (c) and (d) taken from the ack, and several of our orders at one price.
+
+Decision for you: the limitations sheet still describes the journal. That is Limitations rows 20–26 plus A2, D11, D15 and D33, Capacity B6, E6 and E8, and Scaling A65. Should I replace those rows with four ack-time rows and one coverage row, and correct the figures? It means deleting three rows.
+
+Files are in your folder:
+
+mdsys_2.hpp
+qblocklist.hpp
+mdsys_2_cancel_test.cpp
+mdsys_2_cancel_bench.cpp
+mdsys_2_host_bench.cpp
+mdsys_2_late_approx.cpp
+cancel_tactic.pdf
+
+'An order whose Add arrives before its ack is now registered at the ack, using the book and NBBO as they are then, and no book update pays anything for it.' explain
+
+That sentence covers three things.
+
+1. Which orders it applies to. Two messages tell the host about one of our orders:
+
+the feed’s Add, which puts the order in the book under its exchange order ID;
+the order gateway’s ack, which tells the host that this ID is ours.
+
+If the ack arrives first, the host knows the ID when the Add shows up and calls on_place at the Add, exactly as before. If the Add arrives first, the host can’t yet tell the order is ours. The book applies it like any other order, the cancel tactic doesn’t track it, and any of our orders behind it count it as a market round lot.
+
+2. “Registered at the ack, using the book and NBBO as they are then.” When the ack arrives, the host looks the ID up in its order table, where the Add already stored the order’s queue handle. It then calls on_place_late(id, sym, side, px, t_add, qh, cb), and from then on the order is tracked like any other. What on_place would have taken at the Add is taken from the current state instead:
+
+(a) uses the orders and shares ahead now.
+(b) uses the round lots ahead now, with zero cancellations, and counts cancellations from now on.
+(c) measures “moved away” from the NBBO now.
+(d) starts from the join signal’s count if that signal is still live, otherwise from 0.
+
+Nothing that happened between the Add and the ack is seen:
+
+feed:     Add(id 7)   R1 cancels   exec above us   NBBO moves         R2 cancels
+gateway:                                                     ack(id 7)
+tactic:   market      not seen     not seen*       not seen  on_place_late   counted
+          order
+
+* seen only if the join signal was live, through its tape.
+
+So R1’s cancellation never counts toward (b), and that NBBO move never counts toward (c). For (d), executions in that window count only through the join signal. One more consequence: an order at the front of the queue at its ack has nothing ahead to count, so (b) never fires for it.
+
+3. “No book update pays anything for it.” The journal version aimed to rebuild the state as it was at the Add. To do that, every update of a tracked symbol wrote a 32-byte entry into a shared ring, in case some order there later turned out to be ours. That cost 0–6 TSC on every message, even when no order was ever late.
+
+Now nothing is recorded in advance. The handler’s machine code is identical to the journal version built with the journal compiled out. The only cost is inside on_place_late: 66–82 TSC against 56–64 for on_place, paid once per late order, when its ack arrives.
+
+The trade: you get the per-message cost back, and give up exactness for orders whose ack comes after the Add. The loss is mostly (b) and (c) decisions that would have fired before the ack. In the stress test, 31% of those orders had been decided before the ack. For orders not yet decided at the ack, 91% got the same first decision on the same update. Appendix F.3 of the PDF breaks this down by how late the ack arrived.
+
+looks good. any other ideas to simplify ?
+
+Yes, four ideas, largest payoff first. The first two remove real work from the hot path; the last two mostly remove code and test surface.
+
+1. Count instead of reading the queue for (a) and (b). Our order always joins the back of its level. Without size-up priority, the orders ahead of it can only shrink or leave. So everything (a) and (b) need can be set once at placement and then updated from each event:
+
+At placement: orders ahead, shares ahead and round lots ahead come straight from the level’s order count, total shares and a round-lot count, minus our own orders.
+On each removal or cut at our price: the host passes the order’s Add sequence number and its size before and after. It already has the order-table entry in hand when it applies the update. A lower sequence than ours means the order was ahead, so the tactic adjusts that order’s counters and counts any cancellation.
+(a) compares the counters against N and K. (b)’s “at the front or only odd lots ahead” becomes “no round lots left ahead”, and the ratio is cancellations over n0.
+
+What it removes:
+
+the placement walk: 58–60 TSC up to 16 orders ahead, about 2,200 behind 1,024;
+counting the orders ahead on each removal at an armed price: 14–16 TSC;
+the look-ahead once the ratio is met: up to about 96 TSC;
+the per-order flags in QBlockList.
+
+The tactic would no longer read the host’s queue at all, so the host could keep its book in any structure.
+
+What it costs:
+
+The host passes sequence and sizes instead of qflags, and keeps a round-lot count per level.
+An order registered at its ack needs a count of what is ahead of it at that moment, which means one walk at the ack.
+
+It should give the same decisions as today. The brute-force models in the test would confirm that.
+
+2. Drop the adaptive volatility term in (c). Replace σ√horizon with a per-symbol depth threshold that the strategy sets and can change at any time.
+
+What it removes:
+
+the σ and τ updates on every update of a tracked symbol;
+pinning (set_tracking exists mainly to keep those estimates warm);
+four parameters;
+the venue-volatility build and its hook.
+
+A pinned symbol with no orders costs 12 / 34 / 20 TSC today (NBBO unchanged / moved / execution), against 8–10 untracked. I believe most of the extra on NBBO moves and executions is that bookkeeping, and symbols with orders pay it too. I can measure the exact share.
+
+The cost: the threshold no longer widens on its own in a fast market.
+
+3. Drop the option for venues that keep priority on a size increase. Only do this if none of your venues do; you know their rules better than I do. It removes a template parameter, a build and a test dimension, and the one inexact correction at the ack. Idea 1 needs this anyway.
+
+4. One implementation instead of SIMD plus scalar. Sides with one or two orders already run scalar passes. If most of your sides hold few orders, and scalar is within a few TSC at 4–8 orders a side, dropping the SIMD version removes:
+
+the 256-bit kernels;
+the split between inlined and out-of-line code;
+the stack-alignment concerns;
+half the test matrix.
+
+This one needs a measurement before deciding.
+
+Smaller items: hardwire passive_side_only and aggr_from_signal, and drop the (d) gate (aggr_gate_n / aggr_gate_sz) if you don’t use it.
+
+What I’d keep:
+
+(d) starting from the join signal, which is what keeps (d) exact for orders registered at the ack;
+the prefetch calls;
+the 8-orders-a-side layout;
+deciding first and calling back afterwards.
+
+Ideas 2 and 3 are mechanical. Idea 1 is the big one. I’d build it on the same tests and benchmark it against the current version. Do you want me to start with idea 1, or do 2 and 3 first?
